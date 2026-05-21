@@ -1,0 +1,22 @@
+{
+  "enabled_modules": ["engine", "battery", "body", "transmission", "tyre"],
+  "module_weights": {
+    "engine":       0.35,
+    "transmission": 0.25,
+    "battery":      0.20,
+    "body":         0.10,
+    "tyre":         0.10
+  },
+  "tier_1_penalties": {
+    "engine":       20.0,
+    "transmission": 15.0,
+    "battery":      15.0
+  },
+  "alert_score_deltas": {
+    "CRITICAL": 20,
+    "WARNING":  5,
+    "NORMAL":  -10
+  },
+  "alert_max_fault_score": 100,
+  "alert_min_fault_score": 0
+}
