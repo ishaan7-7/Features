@@ -208,6 +208,12 @@ def seed_bronze_silver(module: str, vehicles: list, contracts: dict,
         if p.exists():
             shutil.rmtree(p)
 
+    # Precompute cutoff as a plain date string for fast per-row comparison.
+    # "2024-07-19 23:59:59+00:00"[:10] = "2024-07-19" < "2024-07-20" ✓
+    # Avoids pd.to_datetime(utc=True) + dt.strftime inside the hot loop —
+    # those two calls hang for minutes on Windows with timezone-aware arrays.
+    cutoff_date = cutoff_ts.strftime("%Y-%m-%d")
+
     for sim in vehicles:
         csv = _find_csv(VEHICLES_ROOT / sim, pattern)
         if not csv:
@@ -215,32 +221,34 @@ def seed_bronze_silver(module: str, vehicles: list, contracts: dict,
             continue
 
         t0 = time.time()
-        cum_idx     = 0   # running row index in the full (unsliced) CSV
-        seed_total  = 0
-        rp_idx      = -1
-        rp_hash     = ""
-        last_its    = ""
+        cum_idx    = 0
+        seed_total = 0
+        rp_idx     = -1
+        rp_hash    = ""
+        last_its   = ""
 
         for raw in pd.read_csv(csv, chunksize=CHUNK_SIZE, low_memory=False):
-            raw["_ts"] = pd.to_datetime(raw["timestamp"], utc=True)
-            part = raw[raw["_ts"] < cutoff_ts]
+            # Fast string prefix comparison — no datetime parsing, no timezone
+            seed_mask = raw["timestamp"].str[:10] < cutoff_date
 
-            if part.empty:
+            if not seed_mask.any():
                 cum_idx += len(raw)
-                del raw, part
+                del raw, seed_mask
                 gc.collect()
                 break
 
-            part = part.copy().reset_index(drop=True)
+            part = raw[seed_mask].copy().reset_index(drop=True)
             n = len(part)
 
-            tss = part["_ts"].dt.strftime("%Y-%m-%dT%H:%M:%S.%f+00:00")
+            # Use original CSV timestamp strings directly — no conversion.
+            # The inference service filters by ingest_ts using string comparison
+            # so the format is irrelevant as long as it's lexicographically
+            # ordered, which ISO dates are.
             part["source_id"] = sim
-            part["ingest_ts"] = tss.values
-            part["writer_ts"] = tss.values
-            part["row_hash"]  = [_hash(sim, module, t) for t in tss]
-            part["timestamp"] = tss.values
-            part = part.drop(columns=["_ts", "date"], errors="ignore")
+            part["ingest_ts"] = part["timestamp"]
+            part["writer_ts"] = part["timestamp"]
+            part["row_hash"]  = [_hash(sim, module, t) for t in part["timestamp"]]
+            part = part.drop(columns=["date"], errors="ignore")
 
             rp_idx  = cum_idx + n - 1
             rp_hash = _hash(sim, module, part.iloc[-1]["ingest_ts"])
