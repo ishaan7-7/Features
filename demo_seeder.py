@@ -80,15 +80,13 @@ def _hash(sim: str, mod: str, ts: str) -> str:
     return hashlib.sha256(f"{sim}|{mod}|{ts}".encode()).hexdigest()
 
 
-def _delta_write(path: Path, df, first: bool) -> bool:
-    """Append df to a Delta table; creates it on first call.  Returns False."""
+def _delta_append(path: Path, df) -> None:
+    """Append df to a Delta table, creating it if needed.
+    Always uses mode='append' — matches the live services exactly and avoids
+    the Windows delta-rs lock hang caused by overwrite→append transitions.
+    Uses POSIX path string to prevent backslash issues on Windows."""
     path.mkdir(parents=True, exist_ok=True)
-    write_deltalake(
-        str(path), df,
-        mode="overwrite" if first else "append",
-        schema_mode="overwrite" if first else "merge",
-    )
-    return False
+    write_deltalake(path.as_posix(), df, mode="append")
 
 
 # ── Service class importers ───────────────────────────────────────────────────
@@ -210,8 +208,6 @@ def seed_bronze_silver(module: str, vehicles: list, contracts: dict,
         if p.exists():
             shutil.rmtree(p)
 
-    fb = fs = True   # first_bronze, first_silver
-
     for sim in vehicles:
         csv = _find_csv(VEHICLES_ROOT / sim, pattern)
         if not csv:
@@ -252,7 +248,7 @@ def seed_bronze_silver(module: str, vehicles: list, contracts: dict,
             seed_total += n
 
             # ── write Bronze chunk ──────────────────────────────────────────
-            fb = _delta_write(bp, part, fb)
+            _delta_append(bp, part)
 
             # ── inference + write Silver ONE BATCH AT A TIME ───────────────
             # Never accumulate Silver rows in a list; write each 60-row batch
@@ -263,7 +259,7 @@ def seed_bronze_silver(module: str, vehicles: list, contracts: dict,
                     out = ml.process_batch(batch, sim)
                     if not out.empty:
                         out["inference_ts"] = batch["ingest_ts"].values[: len(out)]
-                        fs = _delta_write(sp, out, fs)
+                        _delta_append(sp, out)
                         del out
                 except Exception:
                     pass
@@ -334,7 +330,6 @@ def seed_gold(modules: list) -> dict:
     state      = GoldStateManager()
     aggregator = HealthAggregator(state)
     max_its: dict = {}
-    fw = True
 
     print("\n[GOLD] Pre-aggregating Silver → window representatives...")
 
@@ -378,7 +373,7 @@ def seed_gold(modules: list) -> dict:
         del agg; gc.collect()
 
         if gold_recs:
-            fw = _delta_write(GOLD_ROOT, pd.DataFrame(gold_recs), fw)
+            _delta_append(GOLD_ROOT, pd.DataFrame(gold_recs))
             print(f"  [GOLD] {mod}: {len(gold_recs)} health records written")
 
     for mod, ts in max_its.items():
