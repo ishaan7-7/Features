@@ -60,6 +60,7 @@ CONTRACTS_FILE   = ROOT / "contracts"         / "master.json"
 PIPELINE_CFG     = ROOT / "config"            / "pipeline_config.json"
 REPLAY_CFG       = ROOT / "replay"            / "config"      / "replay_config.json"
 
+SEED_BASELINE_DIR  = ROOT / "tools" / "_seed_baseline"
 BASE_DATE          = pd.Timestamp("2024-07-05", tz="UTC")
 GOLD_WINDOW_SEC    = 300       # 5-min — mirrors gold_service/src/config.py
 CHUNK_SIZE         = 20_000    # CSV rows per Bronze write cycle
@@ -120,12 +121,32 @@ def _clr() -> None:
             del sys.modules[k]
 
 
-def _imp_inf():
+def _purge_service_paths() -> None:
+    """
+    Remove every service directory from sys.path AND clear src.* from sys.modules.
+
+    Root cause of the 'No module named src.alert_engine' error:
+      inference_service/src/ has an __init__.py (regular package).
+      When alerts_service is on sys.path[0] but inference_service is still on
+      sys.path[N], Python finds inference_service/src/__init__.py and resolves
+      the entire 'src' namespace to inference_service/src/ — which has no
+      alert_engine.py.  Removing ALL service paths before each import block
+      makes Python see exactly ONE src/ directory at a time.
+    """
+    for svc in ("inference_service", "gold_service", "alerts_service"):
+        d = str(ROOT / svc)
+        while d in sys.path:
+            sys.path.remove(d)
     _clr()
+
+
+def _imp_inf():
+    _purge_service_paths()
     d = str(ROOT / "inference_service")
-    if d not in sys.path:
-        sys.path.insert(0, d)
+    sys.path.insert(0, d)
     from src.ml_engine import MLEngine  # noqa: PLC0415
+    sys.path.remove(d)
+    _clr()
     return MLEngine
 
 
@@ -337,13 +358,13 @@ def seed_bronze_silver(module: str, vehicles: list, contracts: dict,
 
 def seed_gold(modules: list) -> dict:
 
-    _clr()
+    _purge_service_paths()
     gd = str(ROOT / "gold_service")
-    if gd in sys.path:
-        sys.path.remove(gd)
     sys.path.insert(0, gd)
     from src.aggregator    import HealthAggregator  # noqa: PLC0415
     from src.state_manager import GoldStateManager  # noqa: PLC0415
+    sys.path.remove(gd)
+    _clr()
 
     for f in (GOLD_STATE_DIR / "checkpoints.json",
               GOLD_STATE_DIR / "vehicle_cache.pkl"):
@@ -463,13 +484,13 @@ def seed_gold(modules: list) -> dict:
 
 def seed_alerts(modules: list, max_its: dict) -> None:
 
-    _clr()
+    _purge_service_paths()
     ad = str(ROOT / "alerts_service")
-    if ad in sys.path:
-        sys.path.remove(ad)
     sys.path.insert(0, ad)
     from src.alert_engine  import AlertEngine        # noqa: PLC0415
     from src.state_manager import AlertStateManager  # noqa: PLC0415
+    sys.path.remove(ad)
+    _clr()
 
     for f in (ALERTS_STATE_DIR / "checkpoints.json",
               ALERTS_STATE_DIR / "alert_state_cache.pkl"):
@@ -565,11 +586,123 @@ def seed_alerts(modules: list, max_its: dict) -> None:
     _clr()
 
 
+# ── Seed baseline snapshot ───────────────────────────────────────────────────
+# Called once at the end of every seeder run.  Saves:
+#   1. Delta table version numbers at seed time  (seed_versions.json)
+#   2. Copies of every checkpoint file           (subdirs per service)
+#
+# start_demo.py reads this on every run and:
+#   • Calls DeltaTable.restore(seed_version) to roll back streaming rows
+#   • Copies checkpoint files back so services resume from Day-15 end
+#
+# Net result: demo can be restarted as many times as needed from Day 16
+# without re-running the full seeder (which takes 30+ minutes).
+
+def _save_seed_baseline(modules: list, vehicles: list) -> None:
+    bd = SEED_BASELINE_DIR
+    bd.mkdir(parents=True, exist_ok=True)
+
+    versions: dict = {}
+    tables = (
+        [(BRONZE_ROOT / m, f"bronze/{m}") for m in modules] +
+        [(SILVER_ROOT / m, f"silver/{m}") for m in modules] +
+        [(GOLD_ROOT,   "gold/vehicle_health"),
+         (ALERTS_ROOT, "gold/alerts")]
+    )
+    for path, key in tables:
+        if path.exists():
+            try:
+                versions[key] = DeltaTable(path.as_posix()).version()
+            except Exception:
+                pass
+
+    (bd / "seed_versions.json").write_text(json.dumps(versions, indent=2))
+
+    replay_bk = bd / "replay_checkpoints"
+    replay_bk.mkdir(exist_ok=True)
+    for mod in modules:
+        for sim in vehicles:
+            src = REPLAY_CKPT_DIR / f"{sim}_{mod}.json"
+            if src.exists():
+                shutil.copy2(src, replay_bk / src.name)
+
+    inf_bk = bd / "inference_state"
+    inf_bk.mkdir(exist_ok=True)
+    for mod in modules:
+        for fname in (f"checkpoints_{mod}.json", f"ml_state_{mod}.pkl"):
+            src = INF_STATE_DIR / fname
+            if src.exists():
+                shutil.copy2(src, inf_bk / fname)
+
+    gold_bk = bd / "gold_state"
+    gold_bk.mkdir(exist_ok=True)
+    for fname in ("checkpoints.json", "vehicle_cache.pkl"):
+        src = GOLD_STATE_DIR / fname
+        if src.exists():
+            shutil.copy2(src, gold_bk / fname)
+
+    alerts_bk = bd / "alerts_state"
+    alerts_bk.mkdir(exist_ok=True)
+    for fname in ("checkpoints.json", "alert_state_cache.pkl"):
+        src = ALERTS_STATE_DIR / fname
+        if src.exists():
+            shutil.copy2(src, alerts_bk / fname)
+
+    print(f"\n[BASELINE] Seed baseline saved → {bd}")
+    print(f"           Delta versions recorded: {list(versions.keys())}")
+    print("           Every start_demo.py run will restore this baseline.")
+
+
+# ── Resume helpers ───────────────────────────────────────────────────────────
+
+def _phase1_done(module: str, vehicles: list) -> bool:
+    """True when Bronze, Silver, replay checkpoints and inference state all exist."""
+    return all([
+        (BRONZE_ROOT / module).exists(),
+        (SILVER_ROOT / module).exists(),
+        (INF_STATE_DIR / f"checkpoints_{module}.json").exists(),
+        (INF_STATE_DIR / f"ml_state_{module}.pkl").exists(),
+        all((REPLAY_CKPT_DIR / f"{sim}_{module}.json").exists() for sim in vehicles),
+    ])
+
+
+def _phase2_done() -> bool:
+    """True when Gold table and both Gold state files exist."""
+    return all([
+        GOLD_ROOT.exists(),
+        (GOLD_STATE_DIR / "checkpoints.json").exists(),
+        (GOLD_STATE_DIR / "vehicle_cache.pkl").exists(),
+    ])
+
+
+def _max_its_from_inf_checkpoints(modules: list) -> dict:
+    """Read max inference_ts per module from already-saved inference checkpoint files."""
+    max_its: dict = {}
+    for mod in modules:
+        ckpt_file = INF_STATE_DIR / f"checkpoints_{mod}.json"
+        if ckpt_file.exists():
+            inf_ckpts = json.loads(ckpt_file.read_text())
+            if inf_ckpts:
+                max_its[mod] = max(inf_ckpts.values())
+    return max_its
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Pre-seed 15 days of data across all pipeline layers."
+    )
     parser.add_argument("--days", type=int, default=15)
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Skip phases whose outputs already exist on disk. "
+            "Use after a partial run crashed mid-way to continue from where it stopped "
+            "without re-running expensive inference."
+        ),
+    )
     args = parser.parse_args()
 
     pipeline_cfg = _j(PIPELINE_CFG)
@@ -580,7 +713,8 @@ def main() -> None:
     cutoff_ts    = BASE_DATE + pd.Timedelta(days=args.days)
 
     print("=" * 60)
-    print(f"DEMO SEEDER — {args.days}-day pre-seed")
+    print(f"DEMO SEEDER — {args.days}-day pre-seed"
+          + ("  [RESUME MODE]" if args.resume else ""))
     print(f"  Vehicles : {vehicles}")
     print(f"  Modules  : {modules}")
     print(f"  Cutoff   : {cutoff_ts.date()}")
@@ -594,14 +728,28 @@ def main() -> None:
 
     t0 = time.time()
 
+    # ── Phase 1: Bronze + Silver (one module at a time) ──────────────────────
+    phase1_ran = False
     for mod in modules:
+        if args.resume and _phase1_done(mod, vehicles):
+            print(f"\n[{mod.upper()}] Phase 1 already complete — skipped (--resume)")
+            continue
         print(f"\n{'─' * 50}\nMODULE: {mod.upper()}\n{'─' * 50}")
         tm = time.time()
         seed_bronze_silver(mod, vehicles, contracts, cutoff_ts)
         print(f"  [{mod.upper()}] Done in {round(time.time() - tm, 1)}s")
+        phase1_ran = True
 
-    max_its = seed_gold(modules)
+    # ── Phase 2: Gold aggregation ────────────────────────────────────────────
+    if args.resume and _phase2_done() and not phase1_ran:
+        print("\n[GOLD] Phase 2 already complete — skipped (--resume)")
+        max_its = _max_its_from_inf_checkpoints(modules)
+    else:
+        max_its = seed_gold(modules)
 
+    # ── Phase 3: Alerts state machine ────────────────────────────────────────
+    # Phase 3 always runs: it's fast and is the most likely crash point,
+    # so we always regenerate it to ensure a clean alerts state.
     gold_ckpt = GOLD_STATE_DIR / "checkpoints.json"
     seed_alerts(modules, _j(gold_ckpt) if gold_ckpt.exists() else max_its)
 
@@ -609,6 +757,8 @@ def main() -> None:
         shutil.rmtree(WRITER_CKPT_DIR)
     WRITER_CKPT_DIR.mkdir(parents=True, exist_ok=True)
     print("\n[WRITER] Spark checkpoints cleared.")
+
+    _save_seed_baseline(modules, vehicles)
 
     elapsed = round(time.time() - t0, 1)
     print(f"\n{'=' * 60}")
