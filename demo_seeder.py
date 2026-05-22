@@ -1,18 +1,20 @@
 """
 Demo Seeder — pre-populates 15 days of data across every pipeline layer.
 
-Designed for 280 000+ rows / vehicle / module.
-Peak RAM at any point: ~200 MB regardless of dataset size.
+Designed for 280 000+ rows / vehicle / module.  All known hang and crash
+points are addressed below.
 
-Key memory controls:
-  CHUNK_SIZE      = 20 000  rows read per CSV chunk (Bronze + Silver)
-  INFERENCE_BATCH = 60      rows per LSTM forward pass
-  Silver written after EACH inference batch (never accumulated)
-  Alerts loads only 5 narrow columns per module (skips top_features JSON)
-  Gold pre-aggregates Silver to 1 row per (vehicle, 5-min window) before
-  feeding the actual HealthAggregator
+Known hazards on Windows (all mitigated):
+  1. delta-rs overwrite→append OS lock contention     → always mode="append"
+  2. pd.to_datetime(utc=True) on large string arrays  → str[:19] trick + astype int64
+  3. Too many delta write transactions causing log     → 1 Silver write / vehicle
+     scan to hang
+  4. Loading ALL Silver columns incl top_features      → PyArrow column projection
+     (~490 MB per module crash)
+  5. Backslash paths in delta-rs Rust layer            → path.as_posix() everywhere
+  6. pd.concat of thousands of small DataFrames        → periodic consolidation
 
-Uses EXACT pipeline code:
+Uses EXACT pipeline code for scoring/aggregation:
   Silver  → inference_service/src/ml_engine.MLEngine.process_batch()
   Gold    → gold_service/src/aggregator.HealthAggregator
             gold_service/src/state_manager.GoldStateManager
@@ -21,7 +23,7 @@ Uses EXACT pipeline code:
 
 PRE-REQUISITE:
   Vehicle CSVs must exist under  data/vehicles/{sim_id}/*.csv
-  If missing: run  extras/Copy_raw_vehicles_csv.ipynb  first.
+  Run  extras/Copy_raw_vehicles_csv.ipynb  first if missing.
 
 Usage:  python tools/demo_seeder.py [--days 15]
 After:  python tools/start_demo.py
@@ -58,11 +60,12 @@ CONTRACTS_FILE   = ROOT / "contracts"         / "master.json"
 PIPELINE_CFG     = ROOT / "config"            / "pipeline_config.json"
 REPLAY_CFG       = ROOT / "replay"            / "config"      / "replay_config.json"
 
-BASE_DATE        = pd.Timestamp("2024-07-05", tz="UTC")
-GOLD_WINDOW_SEC  = 300     # 5-min — matches gold_service/src/config.py
-CHUNK_SIZE       = 20_000  # CSV rows per Bronze/Silver write cycle
-INFERENCE_BATCH  = 60      # rows per LSTM forward pass
-ALERT_BATCH      = 20_000  # rows per dict-iteration batch for alerts
+BASE_DATE          = pd.Timestamp("2024-07-05", tz="UTC")
+GOLD_WINDOW_SEC    = 300       # 5-min — mirrors gold_service/src/config.py
+CHUNK_SIZE         = 20_000    # CSV rows per Bronze write cycle
+INFERENCE_BATCH    = 60        # rows per LSTM forward pass
+CONSOLIDATE_EVERY  = 1_000     # merge Silver buffer every N inference batches
+ALERT_BATCH        = 20_000    # rows per Alerts dict-iteration batch
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -81,19 +84,35 @@ def _hash(sim: str, mod: str, ts: str) -> str:
 
 
 def _delta_append(path: Path, df) -> None:
-    """Append df to a Delta table, creating it if needed.
-    Always uses mode='append' — matches the live services exactly and avoids
-    the Windows delta-rs lock hang caused by overwrite→append transitions.
-    Uses POSIX path string to prevent backslash issues on Windows."""
+    """
+    Append df to a Delta table (creates it on first call).
+    Always mode='append' — avoids the Windows delta-rs lock hang that occurs
+    when switching from mode='overwrite' to mode='append' in the same session.
+    POSIX path prevents backslash issues in the Rust delta-rs layer.
+    """
     path.mkdir(parents=True, exist_ok=True)
     write_deltalake(path.as_posix(), df, mode="append")
 
 
+def _silver_columns(path: Path, columns: list) -> pd.DataFrame:
+    """
+    Read only the specified columns from a Silver Delta table.
+    Uses PyArrow column projection so top_features (200-char JSON × 1.96 M rows
+    ≈ 490 MB) is never loaded — only the columns actually needed are read.
+    POSIX path avoids Windows backslash hang in delta-rs Rust layer.
+    """
+    return (
+        DeltaTable(path.as_posix())
+        .to_pyarrow_dataset()
+        .to_table(columns=columns)
+        .to_pandas()
+    )
+
+
 # ── Service class importers ───────────────────────────────────────────────────
 # gold_service and alerts_service both expose a src/ package.  We clear
-# src.* from sys.modules before each import block so Python resolves the
-# correct config.py.  After import the class objects hold direct references
-# to their own config module — those bindings survive the cache clear.
+# src.* from sys.modules before each import block so Python re-resolves
+# the correct config.py for each service.
 
 def _clr() -> None:
     for k in list(sys.modules):
@@ -110,31 +129,7 @@ def _imp_inf():
     return MLEngine
 
 
-def _imp_gold():
-    _clr()
-    d = str(ROOT / "gold_service")
-    if d in sys.path:
-        sys.path.remove(d)
-    sys.path.insert(0, d)
-    from src.aggregator    import HealthAggregator   # noqa: PLC0415
-    from src.state_manager import GoldStateManager   # noqa: PLC0415
-    _clr()
-    return HealthAggregator, GoldStateManager
-
-
-def _imp_alerts():
-    _clr()
-    d = str(ROOT / "alerts_service")
-    if d in sys.path:
-        sys.path.remove(d)
-    sys.path.insert(0, d)
-    from src.alert_engine  import AlertEngine        # noqa: PLC0415
-    from src.state_manager import AlertStateManager  # noqa: PLC0415
-    _clr()
-    return AlertEngine, AlertStateManager
-
-
-# ── In-memory inference state (no disk I/O during seeding loop) ───────────────
+# ── In-memory inference state ─────────────────────────────────────────────────
 
 class _Inf:
     def __init__(self, module: str):
@@ -178,29 +173,34 @@ def preflight(vehicles: list, modules: list, contracts: dict) -> bool:
             continue
         for mod in modules:
             if _find_csv(d, contracts["modules"][mod]["file_pattern"]) is None:
-                print(f"  MISSING  {sim}/{contracts['modules'][mod]['file_pattern']}")
+                print(f"  MISSING  {sim} / {contracts['modules'][mod]['file_pattern']}")
                 ok = False
     return ok
 
 
-# ── Phase 1 — Bronze + Silver (chunked, Silver written per-batch) ─────────────
+# ── Phase 1 — Bronze + Silver ─────────────────────────────────────────────────
 #
-# Memory budget per iteration:
-#   CHUNK_SIZE rows × ~120 bytes/row   ≈  2.4 MB  (Bronze chunk)
-#   write_deltalake overhead (3×)       ≈  7.2 MB
-#   INFERENCE_BATCH rows × 15 cols      ≈  0.07 MB (one Silver batch)
-#   Silver written immediately — never accumulated
-#   MLEngine (PyTorch + GMM)            ≈ 100 MB
-#   ──────────────────────────────────────────────
-#   Total peak per vehicle              ≈ 110 MB
+# Memory budget (per vehicle, worst case):
+#   One 20 k-row Bronze chunk       ≈   2 MB
+#   delta_append Bronze overhead    ≈   6 MB
+#   CONSOLIDATE_EVERY Silver parts  ≈  30 MB  (1 000 × 60 rows × 15 cols)
+#   One Silver write (280 k rows)   ≈  34 MB
+#   MLEngine (PyTorch + GMM)        ≈ 100 MB
+#   ─────────────────────────────────────────
+#   Total peak                      ≈ 170 MB
+#
+# Hang mitigations applied here:
+#   • String prefix comparison for cutoff  — avoids pd.to_datetime(utc=True)
+#   • One Silver Delta write per vehicle   — avoids thousands of log-scan cycles
+#   • Periodic Silver buffer consolidation — avoids slow pd.concat of 4 667 DFs
 
 def seed_bronze_silver(module: str, vehicles: list, contracts: dict,
                        cutoff_ts: pd.Timestamp) -> None:
 
-    MLEngine  = _imp_inf()
-    pattern   = contracts["modules"][module]["file_pattern"]
-    inf_st    = _Inf(module)
-    ml        = MLEngine(inf_st, module)
+    MLEngine = _imp_inf()
+    pattern  = contracts["modules"][module]["file_pattern"]
+    inf_st   = _Inf(module)
+    ml       = MLEngine(inf_st, module)
 
     bp = BRONZE_ROOT / module
     sp = SILVER_ROOT / module
@@ -208,10 +208,7 @@ def seed_bronze_silver(module: str, vehicles: list, contracts: dict,
         if p.exists():
             shutil.rmtree(p)
 
-    # Precompute cutoff as a plain date string for fast per-row comparison.
-    # "2024-07-19 23:59:59+00:00"[:10] = "2024-07-19" < "2024-07-20" ✓
-    # Avoids pd.to_datetime(utc=True) + dt.strftime inside the hot loop —
-    # those two calls hang for minutes on Windows with timezone-aware arrays.
+    # "2024-07-20" — used for fast string prefix comparison, no datetime overhead
     cutoff_date = cutoff_ts.strftime("%Y-%m-%d")
 
     for sim in vehicles:
@@ -220,15 +217,20 @@ def seed_bronze_silver(module: str, vehicles: list, contracts: dict,
             print(f"    [{module.upper()}] {sim}: no CSV — skipped")
             continue
 
-        t0 = time.time()
+        t0         = time.time()
         cum_idx    = 0
         seed_total = 0
         rp_idx     = -1
         rp_hash    = ""
         last_its   = ""
 
+        # Silver accumulated per-vehicle; written in ONE Delta call at the end.
+        # Periodic consolidation keeps pd.concat fast (never merges > CONSOLIDATE_EVERY DFs).
+        sim_silver:   list = []
+        silver_count: int  = 0
+
         for raw in pd.read_csv(csv, chunksize=CHUNK_SIZE, low_memory=False):
-            # Fast string prefix comparison — no datetime parsing, no timezone
+            # str[:10] < "2024-07-20" — ISO date prefix comparison, no parsing
             seed_mask = raw["timestamp"].str[:10] < cutoff_date
 
             if not seed_mask.any():
@@ -238,52 +240,60 @@ def seed_bronze_silver(module: str, vehicles: list, contracts: dict,
                 break
 
             part = raw[seed_mask].copy().reset_index(drop=True)
-            n = len(part)
+            n    = len(part)
 
-            # Use original CSV timestamp strings directly — no conversion.
-            # The inference service filters by ingest_ts using string comparison
-            # so the format is irrelevant as long as it's lexicographically
-            # ordered, which ISO dates are.
+            # Use original CSV timestamp string directly — inference service
+            # compares ingest_ts as plain strings so exact format is irrelevant.
             part["source_id"] = sim
             part["ingest_ts"] = part["timestamp"]
             part["writer_ts"] = part["timestamp"]
             part["row_hash"]  = [_hash(sim, module, t) for t in part["timestamp"]]
             part = part.drop(columns=["date"], errors="ignore")
 
-            rp_idx  = cum_idx + n - 1
-            rp_hash = _hash(sim, module, part.iloc[-1]["ingest_ts"])
+            rp_idx   = cum_idx + n - 1
+            rp_hash  = _hash(sim, module, part.iloc[-1]["ingest_ts"])
             last_its = part.iloc[-1]["ingest_ts"]
             seed_total += n
 
-            # ── write Bronze chunk ──────────────────────────────────────────
             _delta_append(bp, part)
 
-            # ── inference + write Silver ONE BATCH AT A TIME ───────────────
-            # Never accumulate Silver rows in a list; write each 60-row batch
-            # immediately so Silver memory stays ≈ one batch at a time.
             for start in range(0, n, INFERENCE_BATCH):
                 batch = part.iloc[start : start + INFERENCE_BATCH].copy()
                 try:
                     out = ml.process_batch(batch, sim)
                     if not out.empty:
                         out["inference_ts"] = batch["ingest_ts"].values[: len(out)]
-                        _delta_append(sp, out)
+                        sim_silver.append(out)
+                        silver_count += len(out)
                         del out
                 except Exception:
                     pass
                 del batch
-            # ──────────────────────────────────────────────────────────────
 
             del part
             gc.collect()
 
+            # Periodically merge the Silver buffer so the final pd.concat
+            # only joins a small number of large DataFrames (fast).
+            if len(sim_silver) >= CONSOLIDATE_EVERY:
+                sim_silver = [pd.concat(sim_silver, ignore_index=True)]
+                gc.collect()
+
             past_cutoff = n < len(raw)
-            cum_idx += len(raw)
+            cum_idx    += len(raw)
             del raw
             gc.collect()
 
             if past_cutoff:
                 break
+
+        # ONE Silver write per vehicle — keeps Delta transaction log tiny
+        if sim_silver:
+            silver_df = pd.concat(sim_silver, ignore_index=True)
+            _delta_append(sp, silver_df)
+            del silver_df
+        del sim_silver
+        gc.collect()
 
         if rp_idx >= 0:
             REPLAY_CKPT_DIR.mkdir(parents=True, exist_ok=True)
@@ -309,13 +319,21 @@ def seed_bronze_silver(module: str, vehicles: list, contracts: dict,
     print(f"  [{module.upper()}] Inference state saved.")
 
 
-# ── Phase 2 — Gold  (pre-aggregate Silver then actual HealthAggregator) ───────
+# ── Phase 2 — Gold ────────────────────────────────────────────────────────────
 #
-# Pre-aggregation: 280 k Silver rows → ~4 000 window-reps per vehicle.
-# For 7 vehicles × 5 modules ≈ 140 k window-reps total — fits comfortably.
-# Result is IDENTICAL to the live service because the last update_module_state
-# call within a window is the one that sticks in vehicle_cache, which is
-# exactly what groupby.last() captures.
+# Memory budget (peak across all modules):
+#   Silver load per module (3 cols, NO top_features)   ≈  35 MB
+#   Timestamps converted to int64 immediately          →   8 bytes/row (not strings)
+#   Combined window-reps (5 mods × 7 veh × ~4 k wins)  ≈  15 MB
+#   ─────────────────────────────────────────────────────────────
+#   Total peak                                          ≈  50 MB
+#
+# Hang mitigations applied here:
+#   • PyArrow column projection (no top_features)     — avoids 490 MB crash
+#   • str[:19] + astype int64                         — avoids pd.to_datetime(utc=True) hang
+#   • path.as_posix() for DeltaTable                  — avoids backslash hang
+#   • max_its read from inference checkpoint files    — no Silver read needed for it
+#   • ALL modules combined before Gold computation    — ONE Gold record per (sim, window)
 
 def seed_gold(modules: list) -> dict:
 
@@ -337,52 +355,88 @@ def seed_gold(modules: list) -> dict:
 
     state      = GoldStateManager()
     aggregator = HealthAggregator(state)
-    max_its: dict = {}
 
-    print("\n[GOLD] Pre-aggregating Silver → window representatives...")
+    # Get max_its from already-saved inference checkpoint files.
+    # Since inference_ts == ingest_ts in the seeder, max(ingest_ts) per module
+    # is exactly what Gold needs as its checkpoint.
+    max_its: dict = {}
+    for mod in modules:
+        ckpt_file = INF_STATE_DIR / f"checkpoints_{mod}.json"
+        if ckpt_file.exists():
+            inf_ckpts = json.loads(ckpt_file.read_text())
+            if inf_ckpts:
+                max_its[mod] = max(inf_ckpts.values())
+
+    WINDOW_NS = GOLD_WINDOW_SEC * 1_000_000_000  # 300 s in nanoseconds
+
+    print("\n[GOLD] Loading Silver window-reps (column-projected, no top_features)...")
+    all_reps: list = []
 
     for mod in modules:
         sp = SILVER_ROOT / mod
         if not sp.exists():
-            print(f"  [GOLD] Silver/{mod} missing — skipped"); continue
+            print(f"  [GOLD] Silver/{mod} missing — skipped")
+            continue
         try:
-            df = DeltaTable(str(sp)).to_pandas()
+            # Column projection: load ONLY source_id, timestamp, health_score.
+            # top_features excluded — ~490 MB saving per module.
+            df = _silver_columns(sp, ["source_id", "timestamp", "health_score"])
         except Exception as e:
-            print(f"  [GOLD] Cannot read Silver/{mod}: {e}"); continue
+            print(f"  [GOLD] Cannot read Silver/{mod}: {e}")
+            continue
 
-        if "inference_ts" in df.columns and not df.empty:
-            max_its[mod] = str(df["inference_ts"].max())
-
-        df["_ts"]       = pd.to_datetime(df["timestamp"], utc=True)
-        df["window_ts"] = df["_ts"].dt.floor(f"{GOLD_WINDOW_SEC}s")
+        # Convert timestamp to int64 nanoseconds via str[:19] trick.
+        # "2024-07-05 08:00:00" → pd.to_datetime (fast, no UTC) → int64 (8 bytes).
+        # This avoids pd.to_datetime(utc=True) which hangs on Windows for large arrays.
+        df["_ts_ns"]   = pd.to_datetime(df["timestamp"].str[:19]).astype("int64")
+        df["window_ns"] = (df["_ts_ns"] // WINDOW_NS) * WINDOW_NS
+        df["source_id"] = df["source_id"].astype("category")
         df["module_name"] = mod
 
         agg = (
-            df[["source_id", "window_ts", "_ts", "health_score",
-                "top_features", "module_name"]]
-            .sort_values("_ts")
-            .groupby(["source_id", "window_ts"], sort=False)
+            df[["source_id", "window_ns", "_ts_ns", "health_score", "module_name"]]
+            .sort_values("_ts_ns")
+            .groupby(["source_id", "window_ns"], sort=False)
+            [["health_score", "module_name"]]
             .last()
             .reset_index()
         )
-        del df; gc.collect()
-        print(f"  [GOLD] {mod}: {len(agg)} window-reps")
+        all_reps.append(agg)
+        del df, agg
+        gc.collect()
+        print(f"  [GOLD] {mod}: window-reps collected")
 
-        gold_recs: list = []
-        for (sim, wts), grp in agg.groupby(["source_id", "window_ts"]):
-            for _, row in grp.iterrows():
-                state.update_module_state(
-                    sim_id=sim, module=row["module_name"],
-                    health=row["health_score"],
-                    features_json=row.get("top_features", "{}"),
-                )
-            gold_recs.append(aggregator.compute_gold_record(sim, str(wts)))
+    if not all_reps:
+        print("  [GOLD] No Silver data — skipped")
+        _clr()
+        return max_its
 
-        del agg; gc.collect()
+    # Combine ALL modules and process chronologically — ensures ONE Gold record
+    # per (sim, window) with all module health known at the time of computation.
+    combined = pd.concat(all_reps, ignore_index=True)
+    del all_reps
+    gc.collect()
+    combined = combined.sort_values("window_ns", ascending=True)
+    print(f"  [GOLD] Processing {len(combined)} combined window-reps...")
 
-        if gold_recs:
-            _delta_append(GOLD_ROOT, pd.DataFrame(gold_recs))
-            print(f"  [GOLD] {mod}: {len(gold_recs)} health records written")
+    gold_recs: list = []
+    for (sim, wns), grp in combined.groupby(["source_id", "window_ns"]):
+        window_ts = str(pd.Timestamp(int(wns), unit="ns"))
+        for _, row in grp.iterrows():
+            state.update_module_state(
+                sim_id=str(sim),
+                module=str(row["module_name"]),
+                health=float(row["health_score"]),
+                features_json="{}",   # top_features not loaded; Gold feature
+            )                         # attribution is empty in seed data only.
+        gold_recs.append(aggregator.compute_gold_record(str(sim), window_ts))
+
+    del combined
+    gc.collect()
+
+    if gold_recs:
+        _delta_append(GOLD_ROOT, pd.DataFrame(gold_recs))
+        print(f"  [GOLD] Written: {len(gold_recs)} health records")
 
     for mod, ts in max_its.items():
         state.checkpoints[mod] = ts
@@ -392,14 +446,20 @@ def seed_gold(modules: list) -> dict:
     return max_its
 
 
-# ── Phase 3 — Alerts  (actual AlertEngine, batch dict-iteration) ──────────────
+# ── Phase 3 — Alerts ──────────────────────────────────────────────────────────
 #
-# Memory strategy:
-#   Load Silver per module with only 5 narrow columns — excludes top_features
-#   (200-char JSON × 1.96 M rows = ~400 MB per module avoided).
-#   Alert firing is driven by severity/composite_score, not top_features.
-#   Top_features defaults to {} in AlertEngine when the key is absent.
-#   Process in ALERT_BATCH-row dict batches — ~8× faster than iterrows.
+# Memory budget (peak per module):
+#   Silver load (4 slim cols, NO top_features, NO inference_ts)  ≈  35 MB
+#   ALERT_BATCH dicts in flight                                  ≈  20 MB
+#   ────────────────────────────────────────────────────────────────────────
+#   Total peak                                                   ≈  55 MB
+#
+# Hang mitigations applied here:
+#   • PyArrow column projection (4 cols, no top_features)  — avoids 490 MB crash
+#   • sort_values("timestamp") on raw strings              — avoids pd.to_datetime(utc=True) hang
+#   • astype(str) before to_dict()                         — avoids Categorical scalar
+#                                                            keys in AlertEngine state dict
+#   • ALERTS_ROOT.as_posix() for Delta write               — avoids backslash hang
 
 def seed_alerts(modules: list, max_its: dict) -> None:
 
@@ -435,10 +495,12 @@ def seed_alerts(modules: list, max_its: dict) -> None:
         ("last_updated_ts",     pa.string()),
     ])
 
-    SLIM_COLS = ["source_id", "module_name", "timestamp",
-                 "severity", "composite_score"]
+    # Only 4 columns loaded — top_features excluded entirely.
+    # AlertEngine.process_row() catches KeyError on missing top_features and
+    # uses {} — alert firing is driven by severity/composite_score only.
+    SLIM_COLS = ["source_id", "timestamp", "severity", "composite_score"]
 
-    print("\n[ALERTS] Running leaky-bucket (module by module, dict iteration)...")
+    print("\n[ALERTS] Running leaky-bucket (column-projected Silver, string sort)...")
 
     all_alerts: dict = {}
 
@@ -447,22 +509,25 @@ def seed_alerts(modules: list, max_its: dict) -> None:
         if not sp.exists():
             continue
         try:
-            df = DeltaTable(str(sp)).to_pandas()
+            df = _silver_columns(sp, SLIM_COLS)
         except Exception as e:
-            print(f"  [ALERTS] Cannot read Silver/{mod}: {e}"); continue
+            print(f"  [ALERTS] Cannot read Silver/{mod}: {e}")
+            continue
 
         df["module_name"] = mod
-        df["timestamp"]   = pd.to_datetime(df["timestamp"], utc=True)
+
+        # Sort by raw ISO string — lexicographic order == chronological for ISO 8601.
+        # Avoids pd.to_datetime(utc=True) which hangs on Windows for large arrays.
         df = df.sort_values("timestamp", ascending=True)
 
-        present = [c for c in SLIM_COLS if c in df.columns]
-        df = df[present]
-
-        df["source_id"]    = df["source_id"].astype("category")
-        df["severity"]     = df["severity"].astype("category")
+        # Convert all object/category cols to plain str before to_dict().
+        # Pandas Categorical scalars in dicts cause key-mismatch bugs in
+        # AlertEngine's state dict (keys are f"{sim_id}_{module}" strings).
+        for col in df.select_dtypes(include=["category", "object"]).columns:
+            df[col] = df[col].astype(str)
 
         n_before = len(all_alerts)
-        t_a = time.time()
+        t_a      = time.time()
 
         for b_start in range(0, len(df), ALERT_BATCH):
             batch_dicts = df.iloc[b_start : b_start + ALERT_BATCH].to_dict("records")
@@ -473,17 +538,22 @@ def seed_alerts(modules: list, max_its: dict) -> None:
             del batch_dicts
             gc.collect()
 
-        del df; gc.collect()
+        del df
+        gc.collect()
         fired = len(all_alerts) - n_before
         print(f"  [ALERTS] {mod}: {fired} new records  "
               f"({round(time.time() - t_a, 1)}s)")
 
     if all_alerts:
         adf = pd.DataFrame(list(all_alerts.values()))
-        write_deltalake(str(ALERTS_ROOT),
-                        pa.Table.from_pandas(adf, schema=ALERT_SCHEMA),
-                        mode="append")
-        del adf; gc.collect()
+        # POSIX path — prevents backslash hang in delta-rs Rust write layer
+        write_deltalake(
+            ALERTS_ROOT.as_posix(),
+            pa.Table.from_pandas(adf, schema=ALERT_SCHEMA),
+            mode="append",
+        )
+        del adf
+        gc.collect()
         print(f"  [ALERTS] Written: {len(all_alerts)} total alert records")
     else:
         print("  [ALERTS] No alerts fired — clean 15-day history")
@@ -510,8 +580,7 @@ def main() -> None:
     cutoff_ts    = BASE_DATE + pd.Timedelta(days=args.days)
 
     print("=" * 60)
-    print(f"DEMO SEEDER — {args.days}-day pre-seed  "
-          f"(chunk={CHUNK_SIZE}, alert_batch={ALERT_BATCH})")
+    print(f"DEMO SEEDER — {args.days}-day pre-seed")
     print(f"  Vehicles : {vehicles}")
     print(f"  Modules  : {modules}")
     print(f"  Cutoff   : {cutoff_ts.date()}")
@@ -526,10 +595,10 @@ def main() -> None:
     t0 = time.time()
 
     for mod in modules:
-        print(f"\n{'─'*50}\nMODULE: {mod.upper()}\n{'─'*50}")
+        print(f"\n{'─' * 50}\nMODULE: {mod.upper()}\n{'─' * 50}")
         tm = time.time()
         seed_bronze_silver(mod, vehicles, contracts, cutoff_ts)
-        print(f"  [{mod.upper()}] Done in {round(time.time()-tm,1)}s")
+        print(f"  [{mod.upper()}] Done in {round(time.time() - tm, 1)}s")
 
     max_its = seed_gold(modules)
 
@@ -541,11 +610,11 @@ def main() -> None:
     WRITER_CKPT_DIR.mkdir(parents=True, exist_ok=True)
     print("\n[WRITER] Spark checkpoints cleared.")
 
-    elapsed = round(time.time()-t0, 1)
-    print(f"\n{'='*60}")
-    print(f"SEEDING COMPLETE in {elapsed}s  ({round(elapsed/60,1)} min)")
+    elapsed = round(time.time() - t0, 1)
+    print(f"\n{'=' * 60}")
+    print(f"SEEDING COMPLETE in {elapsed}s  ({round(elapsed / 60, 1)} min)")
     print("Next:  python tools/start_demo.py")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
 
 if __name__ == "__main__":
