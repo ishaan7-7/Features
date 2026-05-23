@@ -1,20 +1,17 @@
 import os
 import json
-import time
 import asyncio
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from confluent_kafka import Consumer, TopicPartition
 
 # --- Paths & Constants ---
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
-DELTA_ROOT = os.path.join(PROJECT_ROOT, "data", "delta", "bronze")
+SILVER_ROOT = os.path.join(PROJECT_ROOT, "data", "delta", "silver")
 STATE_DIR = os.path.join(CURRENT_DIR, "state")
 
 VEHICLE_MODULES = ["battery", "body", "engine", "transmission", "tyre"]
-KAFKA_BROKER = "localhost:9092"
 
 # --- Utils ---
 def safe_read_json(file_path):
@@ -27,21 +24,17 @@ def safe_read_json(file_path):
     return None
 
 # --- Cache ---
-WRITER_METRICS_CACHE = {
-    module: {
-        "module": module.upper(),
-        "status": "OFFLINE",
-        "kafka_total": 0,
-        "delta_total": 0,
-        "true_lag": 0,
-        "throughput": "0.0",
-        "processed": "0.0",
-        "latency_ms": 0
-    } for module in VEHICLE_MODULES
+INFERENCE_METRICS_CACHE = {
+    "active_sims": 0,
+    "active_modules": 0,
+    "global_e2e_ms": 0,
+    "global_inf_ms": 0,
+    "module_stats": {},
+    "recent_alerts": []
 }
 
 # --- App Definition ---
-app = FastAPI(title="Writer Service Backend")
+app = FastAPI(title="Inference Service Backend")
 
 app.add_middleware(
     CORSMiddleware,
@@ -52,115 +45,127 @@ app.add_middleware(
 )
 
 # --- Background Logic ---
-class TelemetryBackend:
-    def __init__(self):
-        self.consumer = None
-        self._connect()
-        
-    def _connect(self):
-        try:
-            conf = {
-                'bootstrap.servers': KAFKA_BROKER, 
-                'group.id': 'writer_service_monitor', 
-                'auto.offset.reset': 'earliest',
-                'enable.auto.commit': False
-            }
-            self.consumer = Consumer(conf)
-        except Exception:
-            pass
+def _sync_update_metrics():
+    """Synchronous function to safely crunch pandas dataframes off the main thread"""
+    global INFERENCE_METRICS_CACHE
+    try:
+        # 1. Load System Alerts
+        all_alerts = []
+        for mod in VEHICLE_MODULES:
+            alerts_file = os.path.join(STATE_DIR, f"system_alerts_{mod}.json")
+            alerts = safe_read_json(alerts_file)
+            if alerts:
+                all_alerts.extend(alerts)
 
-    def get_kafka_counts(self):
-        counts = {m: 0 for m in VEHICLE_MODULES}
-        if not self.consumer:
-            self._connect()
-            return counts
-            
-        for m in VEHICLE_MODULES:
-            topic = f"telemetry.{m}"
-            total = 0
+        # 2. Determine "Virtual Now" to handle offline viewing
+        latest_ts = pd.Timestamp("1970-01-01", tz="UTC")
+        for a in all_alerts:
             try:
-                meta = self.consumer.list_topics(topic, timeout=0.5)
-                if topic in meta.topics:
-                    parts = [TopicPartition(topic, p) for p in meta.topics[topic].partitions]
-                    for p in parts:
-                        _, high = self.consumer.get_watermark_offsets(p, timeout=0.5, cached=False)
-                        if high > 0:
-                            total += high
-            except Exception: 
-                pass
-            counts[m] = total
-        return counts
+                ts = pd.to_datetime(a['timestamp'], utc=True)
+                if ts > latest_ts: latest_ts = ts
+            except: pass
 
-def get_delta_counts():
-    delta_counts = {m: 0 for m in VEHICLE_MODULES}
-    for m in VEHICLE_MODULES:
-        log_path = os.path.join(DELTA_ROOT, m, "_delta_log")
-        total = 0
-        if os.path.exists(log_path):
-            json_files = [os.path.join(log_path, f) for f in os.listdir(log_path) if f.endswith(".json")]
-            for jf in json_files:
+        dfs_by_mod = {}
+        for mod in VEHICLE_MODULES:
+            path = os.path.join(SILVER_ROOT, mod)
+            if not os.path.exists(path): continue
+
+            files = []
+            for r, d, f in os.walk(path):
+                for file in f:
+                    if file.endswith(".parquet"):
+                        files.append(os.path.join(r, file))
+            files.sort(key=os.path.getmtime, reverse=True)
+
+            dfs = []
+            for f in files[:5]: # Check top 5 recent parquets
                 try:
-                    with open(jf, "r") as f:
-                        for line in f:
-                            if "numRecords" in line:
-                                action = json.loads(line)
-                                if "add" in action:
-                                    stats = json.loads(action["add"].get("stats", "{}"))
-                                    total += int(stats.get("numRecords", 0))
-                except Exception:
-                    pass
-        delta_counts[m] = total
-    return delta_counts
+                    df = pd.read_parquet(f)
+                    if not df.empty and 'inference_ts' in df.columns:
+                        df['inference_ts'] = pd.to_datetime(df['inference_ts'], utc=True)
+                        max_df_ts = df['inference_ts'].max()
+                        if max_df_ts > latest_ts: 
+                            latest_ts = max_df_ts
+                        dfs.append(df)
+                except: pass
+            if dfs:
+                dfs_by_mod[mod] = pd.concat(dfs, ignore_index=True)
 
-async def update_writer_metrics_loop():
-    kafka_monitor = TelemetryBackend()
+        # Apply the 5-minute window anchored to the latest recorded data
+        cutoff_dt = latest_ts - pd.Timedelta(minutes=5)
+        
+        recent_alerts = []
+        for a in all_alerts:
+            try:
+                if pd.to_datetime(a['timestamp'], utc=True) >= cutoff_dt:
+                    recent_alerts.append(a)
+            except: pass
+        recent_alerts.sort(key=lambda x: x['timestamp'], reverse=True)
+
+        # 3. Compute Silver Metrics
+        sims = set()
+        module_stats = {}
+        e2e_list = []
+        inf_list = []
+
+        for mod, combined_df in dfs_by_mod.items():
+            combined_df = combined_df[combined_df['inference_ts'] >= cutoff_dt]
+            if combined_df.empty: continue
+
+            combined_df['ingest_ts'] = pd.to_datetime(combined_df.get('ingest_ts', pd.NaT), utc=True)
+            e2e = (combined_df['inference_ts'] - combined_df['ingest_ts']).dt.total_seconds() * 1000
+            
+            if 'writer_ts' in combined_df.columns:
+                combined_df['writer_ts'] = pd.to_datetime(combined_df['writer_ts'], utc=True)
+                inf = (combined_df['inference_ts'] - combined_df['writer_ts']).dt.total_seconds() * 1000
+            else:
+                inf = e2e
+
+            e2e_mean = e2e.mean()
+            inf_mean = inf.mean()
+            e2e_list.append(e2e_mean)
+            inf_list.append(inf_mean)
+
+            if 'source_id' in combined_df.columns:
+                sims.update(combined_df['source_id'].unique().tolist())
+
+            module_stats[mod.upper()] = {
+                "e2e_latency": round(e2e_mean, 1) if pd.notna(e2e_mean) else 0,
+                "inf_latency": round(inf_mean, 1) if pd.notna(inf_mean) else 0,
+                "rows_5m": len(combined_df)
+            }
+
+        # Update Cache Exactly as React Expects
+        INFERENCE_METRICS_CACHE["active_sims"] = len(sims)
+        INFERENCE_METRICS_CACHE["active_modules"] = len(module_stats)
+        INFERENCE_METRICS_CACHE["global_e2e_ms"] = round(sum(e2e_list)/len(e2e_list), 1) if e2e_list else 0
+        INFERENCE_METRICS_CACHE["global_inf_ms"] = round(sum(inf_list)/len(inf_list), 1) if inf_list else 0
+        INFERENCE_METRICS_CACHE["module_stats"] = module_stats
+        INFERENCE_METRICS_CACHE["recent_alerts"] = recent_alerts[:10]
+
+    except Exception as e:
+        print(f"Inference metrics computation failed: {e}")
+
+async def update_inference_metrics_loop():
     while True:
-        try:
-            # Offload heavy synchronous calls to threads
-            k_counts = await asyncio.to_thread(kafka_monitor.get_kafka_counts)
-            d_counts = await asyncio.to_thread(get_delta_counts)
-
-            for module in VEHICLE_MODULES:
-                k_total = k_counts.get(module, 0)
-                d_total = d_counts.get(module, 0)
-                
-                file_path = os.path.join(STATE_DIR, f"writer_metrics_{module}.json")
-                spark_data = safe_read_json(file_path) or {}
-                stream_data = spark_data.get("streams", {}).get(module, {})
-                
-                status = spark_data.get("status", "OFFLINE")
-                if status == "RUNNING" and (time.time() - spark_data.get("last_updated", 0) > 10):
-                    status = "STALLED"
-
-                WRITER_METRICS_CACHE[module] = {
-                    "module": module.upper(),
-                    "status": status,
-                    "kafka_total": k_total,
-                    "delta_total": d_total,
-                    "true_lag": max(0, k_total - d_total),
-                    "throughput": str(round(stream_data.get("input_rate", 0.0), 1)),
-                    "processed": str(round(stream_data.get("process_rate", 0.0), 1)),
-                    "latency_ms": stream_data.get("duration_ms", 0)
-                }
-        except Exception as e:
-            print(f"Writer metric update failed: {e}")
+        await asyncio.to_thread(_sync_update_metrics)
         await asyncio.sleep(2)
 
 @app.on_event("startup")
 async def startup_event():
-    asyncio.create_task(update_writer_metrics_loop())
+    asyncio.create_task(update_inference_metrics_loop())
 
 # --- Endpoints ---
-@app.get("/api/writer/metrics")
-def get_writer_metrics():
-    return WRITER_METRICS_CACHE
+@app.get("/api/inference/metrics")
+def get_inference_metrics():
+    return INFERENCE_METRICS_CACHE
 
-@app.get("/api/writer/inspector/{module}")
-def get_writer_inspector(module: str):
+@app.get("/api/inference/tail/{module}")
+def get_inference_tail(module: str):
     if module not in VEHICLE_MODULES:
         raise HTTPException(status_code=400, detail="Invalid module")
         
-    path = os.path.join(DELTA_ROOT, module)
+    path = os.path.join(SILVER_ROOT, module)
     if not os.path.exists(path): return {"data": []}
         
     files = []
@@ -185,11 +190,12 @@ def get_writer_inspector(module: str):
             return {"data": []}
             
         combined_df = pd.concat(data_frames, ignore_index=True)
-        if "ingest_ts" in combined_df.columns:
-            combined_df["ingest_ts"] = pd.to_datetime(combined_df["ingest_ts"]).astype(str)
-            combined_df = combined_df.sort_values("ingest_ts", ascending=False)
+        if "inference_ts" in combined_df.columns:
+            combined_df["inference_ts"] = pd.to_datetime(combined_df["inference_ts"]).astype(str)
+            combined_df = combined_df.sort_values("inference_ts", ascending=False)
             
         combined_df = combined_df.fillna(0)
+        # Handle timezone-aware/naive datetimes correctly
         for col in combined_df.select_dtypes(include=['datetime64[ns]', 'datetime64[ns, UTC]']).columns:
             combined_df[col] = combined_df[col].astype(str)
             
@@ -200,5 +206,5 @@ def get_writer_inspector(module: str):
 
 if __name__ == "__main__":
     import uvicorn
-    # Writer runs on port 8001
-    uvicorn.run("api:app", host="127.0.0.1", port=8001, reload=True)
+    # Inference runs on port 8002
+    uvicorn.run("api:app", host="127.0.0.1", port=8002, reload=True)
