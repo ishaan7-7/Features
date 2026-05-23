@@ -7,7 +7,9 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
+ROOT_DIR    = Path(__file__).resolve().parent.parent
+DTC_HISTORY = ROOT_DIR / "data" / "dtc_history.json"
+_DTC_HISTORY_MAX = 200
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
@@ -118,6 +120,25 @@ def _smart_attribution(
     return df_crit, df_noncrit
 
 
+def _append_dtc_history(module: str, source_id: str, peak_ts: str, triggers: list) -> None:
+    import datetime
+    DTC_HISTORY.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        entries = json.loads(DTC_HISTORY.read_text()) if DTC_HISTORY.exists() else []
+    except Exception:
+        entries = []
+    entries.append({
+        "run_ts":    datetime.datetime.utcnow().isoformat(),
+        "module":    module,
+        "source_id": source_id,
+        "peak_ts":   peak_ts,
+        "triggers":  triggers,
+    })
+    if len(entries) > _DTC_HISTORY_MAX:
+        entries = entries[-_DTC_HISTORY_MAX:]
+    DTC_HISTORY.write_text(json.dumps(entries, indent=2))
+
+
 def _run_dtc_pipeline(module: str, source_id: str, peak_ts: str) -> dict:
     import plotly.express as px
 
@@ -168,13 +189,15 @@ def _run_dtc_pipeline(module: str, source_id: str, peak_ts: str) -> dict:
         )
         return json.loads(fig.to_json())
 
-    return {
+    result = {
         "success":          True,
         "triggers":         triggers,
         "diagnostics":      diagnostics,
         "critical_plot":    _render(df_crit,    "Critical Fault Maturation",     px.colors.qualitative.Set1),
         "non_critical_plot":_render(df_noncrit, "Non-Critical Fault Maturation", px.colors.qualitative.Pastel1),
     }
+    _append_dtc_history(module, source_id, peak_ts, triggers)
+    return result
 
 
 @app.get("/health")
