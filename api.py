@@ -1,222 +1,204 @@
 import os
-import sys
 import json
+import time
 import asyncio
 import pandas as pd
-from pathlib import Path
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from confluent_kafka import Consumer, TopicPartition
 
-ROOT_DIR    = Path(__file__).resolve().parent.parent
-DTC_HISTORY = ROOT_DIR / "data" / "dtc_history.json"
-_DTC_HISTORY_MAX = 200
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
+# --- Paths & Constants ---
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
+DELTA_ROOT = os.path.join(PROJECT_ROOT, "data", "delta", "bronze")
+STATE_DIR = os.path.join(CURRENT_DIR, "state")
 
-from deltalake import DeltaTable
-import pyarrow.compute as pc
+VEHICLE_MODULES = ["battery", "body", "engine", "transmission", "tyre"]
+KAFKA_BROKER = "localhost:9092"
 
-from DTC.src.inference import DTCInferenceService
-from DTC.src.config import load_dtc_master
+# --- Utils ---
+def safe_read_json(file_path):
+    try:
+        if os.path.exists(file_path):
+            with open(file_path, "r") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return None
 
-BRONZE_ROOT    = ROOT_DIR / "data" / "delta" / "bronze"
-DTC_MASTER_JSON = ROOT_DIR / "contracts" / "DTC_master.json"
-DTC_LOOKBACK_ROWS = 600
-VEHICLE_MODULES   = ["engine", "transmission", "battery", "body", "tyre"]
+# --- Cache ---
+WRITER_METRICS_CACHE = {
+    module: {
+        "module": module.upper(),
+        "status": "OFFLINE",
+        "kafka_total": 0,
+        "delta_total": 0,
+        "true_lag": 0,
+        "throughput": "0.0",
+        "processed": "0.0",
+        "latency_ms": 0
+    } for module in VEHICLE_MODULES
+}
 
-_dtc_services: dict[str, DTCInferenceService] = {}
-_msg_maps:     dict[str, dict[str, str]]       = {}
-
-app = FastAPI(title="DTC Analysis Service")
+# --- App Definition ---
+app = FastAPI(title="Writer Service Backend")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"], 
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# --- Background Logic ---
+class TelemetryBackend:
+    def __init__(self):
+        self.consumer = None
+        self._connect()
+        
+    def _connect(self):
+        try:
+            conf = {
+                'bootstrap.servers': KAFKA_BROKER, 
+                'group.id': 'writer_service_monitor', 
+                'auto.offset.reset': 'earliest',
+                'enable.auto.commit': False
+            }
+            self.consumer = Consumer(conf)
+        except Exception:
+            pass
+
+    def get_kafka_counts(self):
+        counts = {m: 0 for m in VEHICLE_MODULES}
+        if not self.consumer:
+            self._connect()
+            return counts
+            
+        for m in VEHICLE_MODULES:
+            topic = f"telemetry.{m}"
+            total = 0
+            try:
+                meta = self.consumer.list_topics(topic, timeout=0.5)
+                if topic in meta.topics:
+                    parts = [TopicPartition(topic, p) for p in meta.topics[topic].partitions]
+                    for p in parts:
+                        _, high = self.consumer.get_watermark_offsets(p, timeout=0.5, cached=False)
+                        if high > 0:
+                            total += high
+            except Exception: 
+                pass
+            counts[m] = total
+        return counts
+
+def get_delta_counts():
+    delta_counts = {m: 0 for m in VEHICLE_MODULES}
+    for m in VEHICLE_MODULES:
+        log_path = os.path.join(DELTA_ROOT, m, "_delta_log")
+        total = 0
+        if os.path.exists(log_path):
+            json_files = [os.path.join(log_path, f) for f in os.listdir(log_path) if f.endswith(".json")]
+            for jf in json_files:
+                try:
+                    with open(jf, "r") as f:
+                        for line in f:
+                            if "numRecords" in line:
+                                action = json.loads(line)
+                                if "add" in action:
+                                    stats = json.loads(action["add"].get("stats", "{}"))
+                                    total += int(stats.get("numRecords", 0))
+                except Exception:
+                    pass
+        delta_counts[m] = total
+    return delta_counts
+
+async def update_writer_metrics_loop():
+    kafka_monitor = TelemetryBackend()
+    while True:
+        try:
+            # Offload heavy synchronous calls to threads
+            k_counts = await asyncio.to_thread(kafka_monitor.get_kafka_counts)
+            d_counts = await asyncio.to_thread(get_delta_counts)
+
+            for module in VEHICLE_MODULES:
+                k_total = k_counts.get(module, 0)
+                d_total = d_counts.get(module, 0)
+                
+                file_path = os.path.join(STATE_DIR, f"writer_metrics_{module}.json")
+                spark_data = safe_read_json(file_path) or {}
+                stream_data = spark_data.get("streams", {}).get(module, {})
+                
+                status = spark_data.get("status", "OFFLINE")
+                if status == "RUNNING" and (time.time() - spark_data.get("last_updated", 0) > 10):
+                    status = "STALLED"
+
+                WRITER_METRICS_CACHE[module] = {
+                    "module": module.upper(),
+                    "status": status,
+                    "kafka_total": k_total,
+                    "delta_total": d_total,
+                    "true_lag": max(0, k_total - d_total),
+                    "throughput": str(round(stream_data.get("input_rate", 0.0), 1)),
+                    "processed": str(round(stream_data.get("process_rate", 0.0), 1)),
+                    "latency_ms": stream_data.get("duration_ms", 0)
+                }
+        except Exception as e:
+            print(f"Writer metric update failed: {e}")
+        await asyncio.sleep(2)
 
 @app.on_event("startup")
 async def startup_event():
-    await asyncio.to_thread(_load_all_models)
+    asyncio.create_task(update_writer_metrics_loop())
 
+# --- Endpoints ---
+@app.get("/api/writer/metrics")
+def get_writer_metrics():
+    return WRITER_METRICS_CACHE
 
-def _load_all_models() -> None:
-    try:
-        master = load_dtc_master()
-    except Exception as e:
-        print(f"[DTC] Could not load master contract: {e}")
-        return
-
-    for module in VEHICLE_MODULES:
-        if module not in master.get("modules", {}):
+@app.get("/api/writer/inspector/{module}")
+def get_writer_inspector(module: str):
+    if module not in VEHICLE_MODULES:
+        raise HTTPException(status_code=400, detail="Invalid module")
+        
+    path = os.path.join(DELTA_ROOT, module)
+    if not os.path.exists(path): return {"data": []}
+        
+    files = []
+    for root, _, filenames in os.walk(path):
+        if "_delta_log" in root:
             continue
-        try:
-            svc = DTCInferenceService(module)
-            _dtc_services[module] = svc
-            _msg_maps[module] = {
-                d["dtc_code"]: d["dashboard_message"]
-                for d in master["modules"][module]
-            }
-            print(f"[DTC] {module}: {len(svc.models)} models loaded")
-        except Exception as e:
-            print(f"[DTC] {module}: load failed — {e}")
+        for f in filenames:
+            if f.endswith(".parquet"):
+                files.append(os.path.join(root, f))
 
-
-def _fetch_traceback(source_id: str, module: str, peak_ts: pd.Timestamp) -> pd.DataFrame:
-    dt_path = (BRONZE_ROOT / module).as_posix()
-    if not os.path.exists(dt_path):
-        return pd.DataFrame()
+    if not files: return {"data": []}
+    files.sort(key=os.path.getmtime, reverse=True)
+    
+    data_frames = []
     try:
-        dataset = DeltaTable(dt_path).to_pyarrow_dataset()
-        df = (
-            dataset.scanner(filter=(pc.field("source_id") == source_id))
-            .to_table()
-            .to_pandas()
-        )
-        if df.empty:
-            return df
-        df["timestamp"] = pd.to_datetime(df["timestamp"])
-        df = df[df["timestamp"] <= peak_ts]
-        df = df.sort_values("timestamp").tail(DTC_LOOKBACK_ROWS).reset_index(drop=True)
-        return df.ffill().fillna(0.0)
+        for f in files[:10]: 
+            df = pd.read_parquet(f)
+            if not df.empty:
+                data_frames.append(df)
+                
+        if not data_frames:
+            return {"data": []}
+            
+        combined_df = pd.concat(data_frames, ignore_index=True)
+        if "ingest_ts" in combined_df.columns:
+            combined_df["ingest_ts"] = pd.to_datetime(combined_df["ingest_ts"]).astype(str)
+            combined_df = combined_df.sort_values("ingest_ts", ascending=False)
+            
+        combined_df = combined_df.fillna(0)
+        for col in combined_df.select_dtypes(include=['datetime64[ns]', 'datetime64[ns, UTC]']).columns:
+            combined_df[col] = combined_df[col].astype(str)
+            
+        return {"data": combined_df.head(100).to_dict(orient="records")}
+        
     except Exception as e:
-        print(f"[DTC] fetch_traceback error for {source_id}/{module}: {e}")
-        return pd.DataFrame()
-
-
-def _smart_attribution(
-    raw_crit: pd.DataFrame,
-    raw_noncrit: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    cols_crit    = [c for c in raw_crit.columns    if c != "timestamp"]
-    cols_noncrit = [c for c in raw_noncrit.columns if c != "timestamp"]
-
-    raw_buildups: dict = {}
-    for col in cols_crit:
-        floor = raw_crit[col].median()
-        raw_buildups[col] = ((raw_crit[col] - floor).clip(lower=0.0) ** 2).cumsum()
-    for col in cols_noncrit:
-        floor = raw_noncrit[col].median()
-        raw_buildups[col] = ((raw_noncrit[col] - floor).clip(lower=0.0) ** 2).cumsum()
-
-    global_max   = max((s.max() for s in raw_buildups.values()), default=0.0)
-    scale_factor = (1.0 / global_max) if global_max > 1e-6 else 0.0
-
-    df_crit = pd.DataFrame(index=raw_crit.index)
-    if "timestamp" in raw_crit.columns:
-        df_crit["timestamp"] = raw_crit["timestamp"]
-    for col in cols_crit:
-        df_crit[col] = (raw_buildups[col] * scale_factor).clip(upper=1.0)
-
-    df_noncrit = pd.DataFrame(index=raw_noncrit.index)
-    if "timestamp" in raw_noncrit.columns:
-        df_noncrit["timestamp"] = raw_noncrit["timestamp"]
-    for col in cols_noncrit:
-        df_noncrit[col] = (raw_buildups[col] * scale_factor).clip(upper=1.0)
-
-    return df_crit, df_noncrit
-
-
-def _append_dtc_history(module: str, source_id: str, peak_ts: str, triggers: list) -> None:
-    import datetime
-    DTC_HISTORY.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        entries = json.loads(DTC_HISTORY.read_text()) if DTC_HISTORY.exists() else []
-    except Exception:
-        entries = []
-    entries.append({
-        "run_ts":    datetime.datetime.utcnow().isoformat(),
-        "module":    module,
-        "source_id": source_id,
-        "peak_ts":   peak_ts,
-        "triggers":  triggers,
-    })
-    if len(entries) > _DTC_HISTORY_MAX:
-        entries = entries[-_DTC_HISTORY_MAX:]
-    DTC_HISTORY.write_text(json.dumps(entries, indent=2))
-
-
-def _run_dtc_pipeline(module: str, source_id: str, peak_ts: str) -> dict:
-    import plotly.express as px
-
-    svc = _dtc_services.get(module)
-    if svc is None:
-        return {"error": f"No DTC models loaded for module '{module}'. Check DTC/artifacts/{module}/."}
-
-    peak_datetime = pd.to_datetime(peak_ts)
-    bronze_df     = _fetch_traceback(source_id, module, peak_datetime)
-
-    if bronze_df.empty:
-        return {"error": f"No Bronze traceback data found for {source_id} / {module} at {peak_ts}."}
-
-    msg_map     = _msg_maps.get(module, {})
-    diagnostics = {"models_loaded": len(svc.models), "skipped_dtcs": {}}
-    for dtc_code in svc.models:
-        missing = [f for f in svc.configs[dtc_code]["features"] if f not in bronze_df.columns]
-        if missing:
-            diagnostics["skipped_dtcs"][dtc_code] = missing
-
-    raw_results      = svc.analyze_window(bronze_df)
-    df_crit, df_noncrit = _smart_attribution(
-        raw_results["critical"], raw_results["non_critical"]
-    )
-
-    triggers: list = []
-    for col in (c for c in df_crit.columns    if c != "timestamp"):
-        if df_crit[col].max() >= 0.99:
-            triggers.append({"code": col, "severity": "CRITICAL", "message": msg_map.get(col, "Unknown Critical Fault")})
-    for col in (c for c in df_noncrit.columns if c != "timestamp"):
-        if df_noncrit[col].max() >= 0.99:
-            triggers.append({"code": col, "severity": "WARNING",  "message": msg_map.get(col, "Unknown Warning")})
-
-    def _render(df: pd.DataFrame, title: str, palette: list) -> dict | None:
-        cols = [c for c in df.columns if c != "timestamp"]
-        if df.empty or not cols:
-            return None
-        melted = df.melt(id_vars=["timestamp"], value_vars=cols, var_name="DTC_Code", value_name="Risk_Level")
-        fig = px.line(melted, x="timestamp", y="Risk_Level", color="DTC_Code",
-                      title=title, color_discrete_sequence=palette)
-        fig.add_hline(y=1.0, line_dash="dash", line_color="red", annotation_text="100% Failure Trigger")
-        fig.update_yaxes(range=[0, 1.1])
-        fig.update_layout(
-            template="plotly_white",
-            margin=dict(l=20, r=20, t=40, b=20),
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-        )
-        return json.loads(fig.to_json())
-
-    result = {
-        "success":          True,
-        "triggers":         triggers,
-        "diagnostics":      diagnostics,
-        "critical_plot":    _render(df_crit,    "Critical Fault Maturation",     px.colors.qualitative.Set1),
-        "non_critical_plot":_render(df_noncrit, "Non-Critical Fault Maturation", px.colors.qualitative.Pastel1),
-    }
-    _append_dtc_history(module, source_id, peak_ts, triggers)
-    return result
-
-
-@app.get("/health")
-def health() -> dict:
-    return {
-        "status":         "DTC Service Online",
-        "port":           8007,
-        "modules_loaded": list(_dtc_services.keys()),
-    }
-
-
-@app.get("/api/dtc/analyze")
-async def analyze_dtc(module: str, source_id: str, peak_ts: str) -> dict:
-    try:
-        return await asyncio.to_thread(_run_dtc_pipeline, module, source_id, peak_ts)
-    except Exception as e:
-        return {"error": f"DTC pipeline failed: {str(e)}"}
-
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8007)
+    # Writer runs on port 8001
+    uvicorn.run("api:app", host="127.0.0.1", port=8001, reload=True)
