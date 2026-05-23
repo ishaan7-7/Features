@@ -411,7 +411,7 @@ def seed_gold(modules: list) -> dict:
         # This avoids pd.to_datetime(utc=True) which hangs on Windows for large arrays.
         df["_ts_ns"]   = pd.to_datetime(df["timestamp"].str[:19]).astype("int64")
         df["window_ns"] = (df["_ts_ns"] // WINDOW_NS) * WINDOW_NS
-        df["source_id"] = df["source_id"].astype("category")
+        df["source_id"] = df["source_id"].astype(str)
         df["module_name"] = mod
 
         agg = (
@@ -432,12 +432,25 @@ def seed_gold(modules: list) -> dict:
         _clr()
         return max_its
 
-    # Combine ALL modules and process chronologically — ensures ONE Gold record
-    # per (sim, window) with all module health known at the time of computation.
-    combined = pd.concat(all_reps, ignore_index=True)
+    valid_reps = [r for r in all_reps if not r.empty]
     del all_reps
     gc.collect()
-    combined = combined.sort_values("window_ns", ascending=True)
+
+    if not valid_reps:
+        print("  [GOLD] All modules produced empty window-reps — skipped")
+        _clr()
+        return max_its
+
+    try:
+        combined = pd.concat(valid_reps, ignore_index=True)
+    except Exception as exc:
+        print(f"  [GOLD] pd.concat failed: {type(exc).__name__}: {exc}")
+        _clr()
+        return max_its
+    del valid_reps
+    gc.collect()
+    combined.sort_values("window_ns", ascending=True, inplace=True)
+    combined.reset_index(drop=True, inplace=True)
     print(f"  [GOLD] Processing {len(combined)} combined window-reps...")
 
     gold_recs: list = []
@@ -598,9 +611,16 @@ def seed_alerts(modules: list, max_its: dict) -> None:
 # Net result: demo can be restarted as many times as needed from Day 16
 # without re-running the full seeder (which takes 30+ minutes).
 
-def _save_seed_baseline(modules: list, vehicles: list) -> None:
+def _save_seed_baseline(modules: list, vehicles: list, days: int) -> None:
     bd = SEED_BASELINE_DIR
     bd.mkdir(parents=True, exist_ok=True)
+
+    stream_start = BASE_DATE + pd.Timedelta(days=days)
+    (bd / "seed_metadata.json").write_text(json.dumps({
+        "days": days,
+        "base_date": str(BASE_DATE.date()),
+        "stream_start_date": str(stream_start.date()),
+    }, indent=2))
 
     versions: dict = {}
     tables = (
@@ -758,7 +778,7 @@ def main() -> None:
     WRITER_CKPT_DIR.mkdir(parents=True, exist_ok=True)
     print("\n[WRITER] Spark checkpoints cleared.")
 
-    _save_seed_baseline(modules, vehicles)
+    _save_seed_baseline(modules, vehicles, args.days)
 
     elapsed = round(time.time() - t0, 1)
     print(f"\n{'=' * 60}")
