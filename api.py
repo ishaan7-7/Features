@@ -1,36 +1,50 @@
 import os
+import json
+import time
 import asyncio
 import pandas as pd
 from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from confluent_kafka import Consumer, TopicPartition
 from deltalake import DeltaTable
 
 # --- Paths & Constants ---
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
-SILVER_ROOT = os.path.join(PROJECT_ROOT, "data", "delta", "silver")
-GOLD_ROOT = os.path.join(PROJECT_ROOT, "data", "delta", "gold", "vehicle_health")
+DELTA_ROOT = os.path.join(PROJECT_ROOT, "data", "delta", "bronze")
+STATE_DIR = os.path.join(CURRENT_DIR, "state")
 
-try:
-    from src import config as gold_config
-    GOLD_ENABLED_MODULES = gold_config.ENABLED_MODULES
-    GOLD_WEIGHTS = gold_config.NORMALIZED_WEIGHTS
-    GOLD_PENALTIES = gold_config.TIER_1_PENALTIES
-except ImportError:
-    GOLD_ENABLED_MODULES = ["engine", "transmission", "battery", "body", "tyre"]
-    GOLD_WEIGHTS = {"engine": 0.35, "transmission": 0.25, "battery": 0.20, "body": 0.10, "tyre": 0.10}
-    GOLD_PENALTIES = {"engine": 30.0, "transmission": 25.0, "battery": 20.0}
+VEHICLE_MODULES = ["battery", "body", "engine", "transmission", "tyre"]
+KAFKA_BROKER = "localhost:9092"
+SERVICE_START_TIME = time.time()
+
+# --- Utils ---
+def safe_read_json(file_path):
+    try:
+        if os.path.exists(file_path):
+            with open(file_path, "r") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return None
 
 # --- Cache ---
-GOLD_METRICS_CACHE = {
-    "active_sims": [],
-    "total_gold_rows": 0,
-    "processing_lags": {mod: 0 for mod in GOLD_ENABLED_MODULES}
+WRITER_METRICS_CACHE = {
+    module: {
+        "module": module.upper(),
+        "status": "OFFLINE",
+        "kafka_total": 0,
+        "delta_total": 0,
+        "true_lag": 0,
+        "throughput": "0.0",
+        "processed": "0.0",
+        "latency_ms": 0
+    } for module in VEHICLE_MODULES
 }
 
 # --- App Definition ---
-app = FastAPI(title="Gold Service Backend")
+app = FastAPI(title="Writer Service Backend")
 
 app.add_middleware(
     CORSMiddleware,
@@ -41,97 +55,154 @@ app.add_middleware(
 )
 
 # --- Background Logic ---
-def _sync_update_metrics():
-    """Synchronous file I/O operations executed in a separate thread"""
-    global GOLD_METRICS_CACHE
-    try:
-        silver_counts = {m: 0 for m in GOLD_ENABLED_MODULES}
-        for mod in GOLD_ENABLED_MODULES:
-            silver_path = Path(SILVER_ROOT) / mod
-            if silver_path.exists():
-                try:
-                    if DeltaTable.is_deltatable(silver_path.as_posix()):
-                        silver_counts[mod] = DeltaTable(silver_path.as_posix()).to_pyarrow_dataset().count_rows()
-                except Exception:
-                    pass
+class TelemetryBackend:
+    def __init__(self):
+        self.consumer = None
+        self._connect()
+        
+    def _connect(self):
+        try:
+            conf = {
+                'bootstrap.servers': KAFKA_BROKER, 
+                'group.id': 'writer_service_monitor', 
+                'auto.offset.reset': 'earliest',
+                'enable.auto.commit': False
+            }
+            self.consumer = Consumer(conf)
+        except Exception:
+            pass
 
-        gold_count = 0
-        active_sims = set()
-        gold_path = Path(GOLD_ROOT)
-        if gold_path.exists():
+    def get_kafka_counts(self):
+        counts = {m: 0 for m in VEHICLE_MODULES}
+        if not self.consumer:
+            self._connect()
+            return counts
+            
+        for m in VEHICLE_MODULES:
+            topic = f"telemetry.{m}"
+            total = 0
             try:
-                if DeltaTable.is_deltatable(gold_path.as_posix()):
-                    dt = DeltaTable(gold_path.as_posix())
-                    ds = dt.to_pyarrow_dataset()
-                    gold_count = ds.count_rows()
-                    tbl = ds.to_table(columns=["source_id"])
-                    active_sims = set(tbl.column("source_id").to_pylist())
-            except Exception:
+                meta = self.consumer.list_topics(topic, timeout=0.5)
+                if topic in meta.topics:
+                    parts = [TopicPartition(topic, p) for p in meta.topics[topic].partitions]
+                    for p in parts:
+                        _, high = self.consumer.get_watermark_offsets(p, timeout=0.5, cached=False)
+                        if high > 0:
+                            total += high
+            except Exception: 
                 pass
+            counts[m] = total
+        return counts
 
-        GOLD_METRICS_CACHE["active_sims"] = sorted(list(active_sims))
-        GOLD_METRICS_CACHE["total_gold_rows"] = gold_count
-        GOLD_METRICS_CACHE["processing_lags"] = {mod: max(0, silver_counts[mod] - gold_count) for mod in GOLD_ENABLED_MODULES}
+def get_delta_counts():
+    delta_counts = {m: 0 for m in VEHICLE_MODULES}
+    for m in VEHICLE_MODULES:
+        path = Path(DELTA_ROOT) / m
+        if not path.exists():
+            continue
+        try:
+            if DeltaTable.is_deltatable(path.as_posix()):
+                delta_counts[m] = DeltaTable(path.as_posix()).to_pyarrow_dataset().count_rows()
+        except Exception:
+            pass
+    return delta_counts
 
-    except Exception as e:
-        print(f"Gold metrics loop failed: {e}")
-
-async def update_gold_metrics_loop():
+async def update_writer_metrics_loop():
+    kafka_monitor = TelemetryBackend()
     while True:
-        await asyncio.to_thread(_sync_update_metrics)
+        try:
+            # Offload heavy synchronous calls to threads
+            k_counts = await asyncio.to_thread(kafka_monitor.get_kafka_counts)
+            d_counts = await asyncio.to_thread(get_delta_counts)
+
+            for module in VEHICLE_MODULES:
+                k_total = k_counts.get(module, 0)
+                d_total = d_counts.get(module, 0)
+                
+                file_path = os.path.join(STATE_DIR, f"writer_metrics_{module}.json")
+                spark_data = safe_read_json(file_path) or {}
+                stream_data = spark_data.get("streams", {}).get(module, {})
+                
+                status = spark_data.get("status", "OFFLINE")
+                last_updated = spark_data.get("last_updated", 0)
+                if status == "RUNNING":
+                    if last_updated < SERVICE_START_TIME:
+                        status = "STARTING"
+                    elif time.time() - last_updated > 10:
+                        status = "STALLED"
+
+                WRITER_METRICS_CACHE[module] = {
+                    "module": module.upper(),
+                    "status": status,
+                    "kafka_total": k_total,
+                    "delta_total": d_total,
+                    "true_lag": max(0, k_total - d_total),
+                    "throughput": str(round(stream_data.get("input_rate", 0.0), 1)),
+                    "processed": str(round(stream_data.get("process_rate", 0.0), 1)),
+                    "latency_ms": stream_data.get("duration_ms", 0)
+                }
+        except Exception as e:
+            print(f"Writer metric update failed: {e}")
         await asyncio.sleep(2)
 
 @app.on_event("startup")
 async def startup_event():
-    asyncio.create_task(update_gold_metrics_loop())
+    asyncio.create_task(update_writer_metrics_loop())
 
 # --- Endpoints ---
-@app.get("/api/gold/metrics")
-def get_gold_metrics():
-    return GOLD_METRICS_CACHE
+@app.get("/api/writer/metrics")
+def get_writer_metrics():
+    return WRITER_METRICS_CACHE
 
-@app.get("/api/gold/config")
-def get_gold_config():
-    return {
-        "enabled_modules": GOLD_ENABLED_MODULES,
-        "default_weights": GOLD_WEIGHTS,
-        "tier_1_penalties": GOLD_PENALTIES
-    }
-
-@app.get("/api/gold/history/{sim_id}")
-def get_gold_history(sim_id: str):
-    gold_path = Path(GOLD_ROOT)
-    if not gold_path.exists():
+@app.get("/api/writer/inspector/{module}")
+def get_writer_inspector(module: str):
+    if module not in VEHICLE_MODULES:
+        raise HTTPException(status_code=400, detail="Invalid module")
+    path = Path(DELTA_ROOT) / module
+    if not path.exists():
         return {"data": []}
     try:
-        if not DeltaTable.is_deltatable(gold_path.as_posix()):
+        parquet_files = []
+        for root, dirs, files in os.walk(str(path)):
+            dirs[:] = [d for d in dirs if not d.startswith("_")]
+            for fname in files:
+                if fname.endswith(".parquet"):
+                    parquet_files.append(Path(root) / fname)
+
+        if not parquet_files:
             return {"data": []}
-        df = DeltaTable(gold_path.as_posix()).to_pyarrow_dataset().to_table().to_pandas()
+
+        parquet_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        parquet_files = parquet_files[:8]
+
+        dfs = []
+        for f in parquet_files:
+            try:
+                df_file = pd.read_parquet(f)
+                for part in f.parts:
+                    if part.startswith("source_id="):
+                        df_file["source_id"] = part.split("=")[1]
+                        break
+                if not df_file.empty:
+                    dfs.append(df_file)
+            except Exception:
+                pass
+
+        if not dfs:
+            return {"data": []}
+
+        combined = pd.concat(dfs, ignore_index=True)
+        if "ingest_ts" in combined.columns:
+            combined["ingest_ts"] = pd.to_datetime(combined["ingest_ts"]).astype(str)
+            combined = combined.sort_values("ingest_ts", ascending=False)
+        combined = combined.fillna(0)
+        for col in combined.select_dtypes(include=["datetime64[ns]", "datetime64[ns, UTC]"]).columns:
+            combined[col] = combined[col].astype(str)
+        return {"data": combined.head(100).to_dict(orient="records")}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    if df.empty or 'source_id' not in df.columns:
-        return {"data": []}
-
-    if sim_id.upper() != "ALL":
-        df = df[df['source_id'] == sim_id]
-
-    if df.empty:
-        return {"data": []}
-
-    if 'gold_window_ts' in df.columns:
-        df['gold_window_ts'] = pd.to_datetime(df['gold_window_ts'])
-        df = df.sort_values('gold_window_ts', ascending=True)
-        if sim_id.upper() != "ALL":
-            df = df.drop_duplicates(subset=['gold_window_ts'], keep='last')
-
-    df = df.fillna(0)
-    for col in df.select_dtypes(include=['datetime64[ns]', 'datetime64[ns, UTC]']).columns:
-        df[col] = df[col].astype(str)
-
-    return {"data": df.tail(1000).to_dict(orient="records")}
-
 if __name__ == "__main__":
     import uvicorn
-    # Gold runs on port 8003
-    uvicorn.run("api:app", host="127.0.0.1", port=8003, reload=True)
+    # Writer runs on port 8001
+    uvicorn.run("api:app", host="127.0.0.1", port=8001, reload=True)
