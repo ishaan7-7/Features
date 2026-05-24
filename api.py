@@ -1,5 +1,4 @@
 import os
-import json
 import asyncio
 import pandas as pd
 from pathlib import Path
@@ -11,32 +10,27 @@ from deltalake import DeltaTable
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
 SILVER_ROOT = os.path.join(PROJECT_ROOT, "data", "delta", "silver")
-STATE_DIR = os.path.join(CURRENT_DIR, "state")
+GOLD_ROOT = os.path.join(PROJECT_ROOT, "data", "delta", "gold", "vehicle_health")
 
-VEHICLE_MODULES = ["battery", "body", "engine", "transmission", "tyre"]
-
-# --- Utils ---
-def safe_read_json(file_path):
-    try:
-        if os.path.exists(file_path):
-            with open(file_path, "r") as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return None
+try:
+    from src import config as gold_config
+    GOLD_ENABLED_MODULES = gold_config.ENABLED_MODULES
+    GOLD_WEIGHTS = gold_config.NORMALIZED_WEIGHTS
+    GOLD_PENALTIES = gold_config.TIER_1_PENALTIES
+except ImportError:
+    GOLD_ENABLED_MODULES = ["engine", "transmission", "battery", "body", "tyre"]
+    GOLD_WEIGHTS = {"engine": 0.35, "transmission": 0.25, "battery": 0.20, "body": 0.10, "tyre": 0.10}
+    GOLD_PENALTIES = {"engine": 30.0, "transmission": 25.0, "battery": 20.0}
 
 # --- Cache ---
-INFERENCE_METRICS_CACHE = {
-    "active_sims": 0,
-    "active_modules": 0,
-    "global_e2e_ms": 0,
-    "global_inf_ms": 0,
-    "module_stats": {},
-    "recent_alerts": []
+GOLD_METRICS_CACHE = {
+    "active_sims": [],
+    "total_gold_rows": 0,
+    "processing_lags": {mod: 0 for mod in GOLD_ENABLED_MODULES}
 }
 
 # --- App Definition ---
-app = FastAPI(title="Inference Service Backend")
+app = FastAPI(title="Gold Service Backend")
 
 app.add_middleware(
     CORSMiddleware,
@@ -48,150 +42,96 @@ app.add_middleware(
 
 # --- Background Logic ---
 def _sync_update_metrics():
-    """Synchronous function to safely crunch pandas dataframes off the main thread"""
-    global INFERENCE_METRICS_CACHE
+    """Synchronous file I/O operations executed in a separate thread"""
+    global GOLD_METRICS_CACHE
     try:
-        # 1. Load System Alerts
-        all_alerts = []
-        for mod in VEHICLE_MODULES:
-            alerts_file = os.path.join(STATE_DIR, f"system_alerts_{mod}.json")
-            alerts = safe_read_json(alerts_file)
-            if alerts:
-                all_alerts.extend(alerts)
-
-        # 2. Determine "Virtual Now" to handle offline viewing
-        latest_ts = pd.Timestamp("1970-01-01", tz="UTC")
-        for a in all_alerts:
-            try:
-                ts = pd.to_datetime(a['timestamp'], utc=True)
-                if ts > latest_ts: latest_ts = ts
-            except: pass
-
-        dfs_by_mod = {}
-        mod_latest_ts = {}
-        for mod in VEHICLE_MODULES:
-            path = os.path.join(SILVER_ROOT, mod)
-            if not os.path.exists(path): continue
-
-            files = []
-            for r, d, f in os.walk(path):
-                if "_delta_log" in r:
-                    continue
-                for file in f:
-                    if file.endswith(".parquet"):
-                        files.append(os.path.join(r, file))
-            files.sort(key=os.path.getmtime, reverse=True)
-
-            dfs = []
-            mod_max = pd.Timestamp("1970-01-01", tz="UTC")
-            for f in files[:5]:
+        silver_counts = {m: 0 for m in GOLD_ENABLED_MODULES}
+        for mod in GOLD_ENABLED_MODULES:
+            silver_path = Path(SILVER_ROOT) / mod
+            if silver_path.exists():
                 try:
-                    df = pd.read_parquet(f)
-                    if not df.empty and 'inference_ts' in df.columns:
-                        df['inference_ts'] = pd.to_datetime(df['inference_ts'], utc=True)
-                        max_df_ts = df['inference_ts'].max()
-                        if max_df_ts > latest_ts:
-                            latest_ts = max_df_ts
-                        if max_df_ts > mod_max:
-                            mod_max = max_df_ts
-                        dfs.append(df)
-                except: pass
-            if dfs:
-                dfs_by_mod[mod] = pd.concat(dfs, ignore_index=True)
-                mod_latest_ts[mod] = mod_max
+                    if DeltaTable.is_deltatable(silver_path.as_posix()):
+                        silver_counts[mod] = DeltaTable(silver_path.as_posix()).to_pyarrow_dataset().count_rows()
+                except Exception:
+                    pass
 
-        recent_alerts = []
-        global_cutoff = latest_ts - pd.Timedelta(minutes=5)
-        for a in all_alerts:
+        gold_count = 0
+        active_sims = set()
+        gold_path = Path(GOLD_ROOT)
+        if gold_path.exists():
             try:
-                if pd.to_datetime(a['timestamp'], utc=True) >= global_cutoff:
-                    recent_alerts.append(a)
-            except: pass
-        recent_alerts.sort(key=lambda x: x['timestamp'], reverse=True)
+                if DeltaTable.is_deltatable(gold_path.as_posix()):
+                    dt = DeltaTable(gold_path.as_posix())
+                    ds = dt.to_pyarrow_dataset()
+                    gold_count = ds.count_rows()
+                    tbl = ds.to_table(columns=["source_id"])
+                    active_sims = set(tbl.column("source_id").to_pylist())
+            except Exception:
+                pass
 
-        # 3. Compute Silver Metrics
-        sims = set()
-        module_stats = {}
-        e2e_list = []
-        inf_list = []
-
-        for mod, combined_df in dfs_by_mod.items():
-            mod_cutoff = mod_latest_ts.get(mod, latest_ts) - pd.Timedelta(minutes=5)
-            combined_df = combined_df[combined_df['inference_ts'] >= mod_cutoff]
-            if combined_df.empty: continue
-
-            combined_df['ingest_ts'] = pd.to_datetime(combined_df.get('ingest_ts', pd.NaT), utc=True)
-            e2e = (combined_df['inference_ts'] - combined_df['ingest_ts']).dt.total_seconds() * 1000
-            
-            if 'writer_ts' in combined_df.columns:
-                combined_df['writer_ts'] = pd.to_datetime(combined_df['writer_ts'], utc=True)
-                inf = (combined_df['inference_ts'] - combined_df['writer_ts']).dt.total_seconds() * 1000
-            else:
-                inf = e2e
-
-            e2e_mean = e2e.mean()
-            inf_mean = inf.mean()
-            e2e_list.append(e2e_mean)
-            inf_list.append(inf_mean)
-
-            if 'source_id' in combined_df.columns:
-                sims.update(combined_df['source_id'].unique().tolist())
-
-            module_stats[mod.upper()] = {
-                "e2e_latency": round(e2e_mean, 1) if pd.notna(e2e_mean) else 0,
-                "inf_latency": round(inf_mean, 1) if pd.notna(inf_mean) else 0,
-                "rows_5m": len(combined_df)
-            }
-
-        # Update Cache Exactly as React Expects
-        INFERENCE_METRICS_CACHE["active_sims"] = len(sims)
-        INFERENCE_METRICS_CACHE["active_modules"] = len(module_stats)
-        INFERENCE_METRICS_CACHE["global_e2e_ms"] = round(sum(e2e_list)/len(e2e_list), 1) if e2e_list else 0
-        INFERENCE_METRICS_CACHE["global_inf_ms"] = round(sum(inf_list)/len(inf_list), 1) if inf_list else 0
-        INFERENCE_METRICS_CACHE["module_stats"] = module_stats
-        INFERENCE_METRICS_CACHE["recent_alerts"] = recent_alerts[:10]
+        GOLD_METRICS_CACHE["active_sims"] = sorted(list(active_sims))
+        GOLD_METRICS_CACHE["total_gold_rows"] = gold_count
+        GOLD_METRICS_CACHE["processing_lags"] = {mod: max(0, silver_counts[mod] - gold_count) for mod in GOLD_ENABLED_MODULES}
 
     except Exception as e:
-        print(f"Inference metrics computation failed: {e}")
+        print(f"Gold metrics loop failed: {e}")
 
-async def update_inference_metrics_loop():
+async def update_gold_metrics_loop():
     while True:
         await asyncio.to_thread(_sync_update_metrics)
         await asyncio.sleep(2)
 
 @app.on_event("startup")
 async def startup_event():
-    asyncio.create_task(update_inference_metrics_loop())
+    asyncio.create_task(update_gold_metrics_loop())
 
 # --- Endpoints ---
-@app.get("/api/inference/metrics")
-def get_inference_metrics():
-    return INFERENCE_METRICS_CACHE
+@app.get("/api/gold/metrics")
+def get_gold_metrics():
+    return GOLD_METRICS_CACHE
 
-@app.get("/api/inference/tail/{module}")
-def get_inference_tail(module: str):
-    if module not in VEHICLE_MODULES:
-        raise HTTPException(status_code=400, detail="Invalid module")
-    path = Path(SILVER_ROOT) / module
-    if not path.exists():
+@app.get("/api/gold/config")
+def get_gold_config():
+    return {
+        "enabled_modules": GOLD_ENABLED_MODULES,
+        "default_weights": GOLD_WEIGHTS,
+        "tier_1_penalties": GOLD_PENALTIES
+    }
+
+@app.get("/api/gold/history/{sim_id}")
+def get_gold_history(sim_id: str):
+    gold_path = Path(GOLD_ROOT)
+    if not gold_path.exists():
         return {"data": []}
     try:
-        if not DeltaTable.is_deltatable(path.as_posix()):
+        if not DeltaTable.is_deltatable(gold_path.as_posix()):
             return {"data": []}
-        df = DeltaTable(path.as_posix()).to_pyarrow_dataset().to_table().to_pandas()
-        if df.empty:
-            return {"data": []}
-        if "inference_ts" in df.columns:
-            df["inference_ts"] = pd.to_datetime(df["inference_ts"]).astype(str)
-            df = df.sort_values("inference_ts", ascending=False)
-        df = df.fillna(0)
-        for col in df.select_dtypes(include=['datetime64[ns]', 'datetime64[ns, UTC]']).columns:
-            df[col] = df[col].astype(str)
-        return {"data": df.head(100).to_dict(orient="records")}
+        df = DeltaTable(gold_path.as_posix()).to_pyarrow_dataset().to_table().to_pandas()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+    if df.empty or 'source_id' not in df.columns:
+        return {"data": []}
+
+    if sim_id.upper() != "ALL":
+        df = df[df['source_id'] == sim_id]
+
+    if df.empty:
+        return {"data": []}
+
+    if 'gold_window_ts' in df.columns:
+        df['gold_window_ts'] = pd.to_datetime(df['gold_window_ts'])
+        df = df.sort_values('gold_window_ts', ascending=True)
+        if sim_id.upper() != "ALL":
+            df = df.drop_duplicates(subset=['gold_window_ts'], keep='last')
+
+    df = df.fillna(0)
+    for col in df.select_dtypes(include=['datetime64[ns]', 'datetime64[ns, UTC]']).columns:
+        df[col] = df[col].astype(str)
+
+    return {"data": df.tail(1000).to_dict(orient="records")}
+
 if __name__ == "__main__":
     import uvicorn
-    # Inference runs on port 8002
-    uvicorn.run("api:app", host="127.0.0.1", port=8002, reload=True)
+    # Gold runs on port 8003
+    uvicorn.run("api:app", host="127.0.0.1", port=8003, reload=True)
