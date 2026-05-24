@@ -58,6 +58,19 @@ export default function GoldHealth() {
     }
   }, [config]);
 
+  const fleetHealthKpi = useMemo(() => {
+    if (!history || history.length === 0) return 0;
+    const latestPerVehicle: Record<string, number> = {};
+    history.forEach((row: any) => {
+      if (row.source_id !== undefined && row.vehicle_health_score !== undefined) {
+        latestPerVehicle[String(row.source_id)] = row.vehicle_health_score;
+      }
+    });
+    const healths = Object.values(latestPerVehicle);
+    if (healths.length === 0) return 0;
+    return parseFloat((healths.reduce((s, h) => s + h, 0) / healths.length).toFixed(1));
+  }, [history]);
+
   // --- KPI LOGIC ---
   const displayLag = useMemo(() => {
     if (!metrics || !metrics.processing_lags) return 0;
@@ -93,30 +106,15 @@ export default function GoldHealth() {
     // Step 1: Calculate raw reverse-engineered health for every row
     const processedRows = history.map((row: any) => {
       let simulatedHealth = 0;
-      let minPenaltyHealth = 100;
       const parsedRow: any = { ...row, ts_short: row.gold_window_ts };
 
       activeModules.forEach(mod => {
         const contribKey = `${mod}_contrib`;
-        const currentContrib = row[contribKey] || 0;
-        const rawHealth = currentContrib;
-        parsedRow[`${mod}_raw`] = rawHealth; 
-
-        const customWeight = expWeights[mod] || 0;
-        simulatedHealth += (rawHealth * customWeight);
-
-        const penaltyThresh = config.tier_1_penalties[mod];
-        if (penaltyThresh && rawHealth < penaltyThresh) {
-          minPenaltyHealth = Math.min(minPenaltyHealth, rawHealth);
-        }
+        const rawHealth = row[contribKey] || 0;
+        parsedRow[`${mod}_raw`] = rawHealth;
+        simulatedHealth += rawHealth * (expWeights[mod] || 0);
       });
 
-      if (minPenaltyHealth < 100 && minPenaltyHealth < simulatedHealth) {
-        simulatedHealth = minPenaltyHealth;
-        parsedRow.penalty_active = true;
-      } else {
-        parsedRow.penalty_active = false;
-      }
       parsedRow.experimental_health = parseFloat(simulatedHealth.toFixed(2));
       return parsedRow;
     });
@@ -163,24 +161,30 @@ export default function GoldHealth() {
 
   const tableColDefs = useMemo<ColDef[]>(() => {
     if (!history || !history[0]) return [];
-    
-    // Explicitly place SOURCE_ID at the front if it exists
+
+    const contribModules = new Set(ALL_MODULES.map(m => `${m}_contrib`));
+    const friendlyName = (key: string): string => {
+      const m = key.replace(/_contrib$/, '');
+      if (contribModules.has(key)) return `${m.toUpperCase()} MODULE HEALTH`;
+      return key.toUpperCase().replace(/_/g, ' ');
+    };
+
     const keys = Object.keys(history[0]).filter(k => k !== 'top_5_features' && k !== 'source_id');
     const cols: ColDef[] = [];
-    
+
     if (history[0].source_id) {
       cols.push({ field: 'source_id', headerName: 'VEHICLE ID', sortable: true, filter: true, width: 130, pinned: 'left' });
     }
-    
+
     keys.forEach(key => {
       cols.push({
         field: key,
-        headerName: key.toUpperCase().replace(/_/g, ' '),
+        headerName: friendlyName(key),
         sortable: true,
         filter: true,
         width: key.includes('ts') ? 200 : 140,
         cellStyle: key === 'vehicle_health_score' ? (params: any) => ({
-          fontWeight: 'bold', 
+          fontWeight: 'bold',
           color: params.value < 50 ? '#d32f2f' : (params.value < 80 ? '#f57c00' : '#388e3c')
         }) : undefined
       });
@@ -236,7 +240,7 @@ export default function GoldHealth() {
               { label: 'ACTIVE SIMULATIONS', value: availableSims.length },
               { label: 'TOTAL GOLD ROWS', value: metrics?.total_gold_rows?.toLocaleString() || 0 },
               { label: filterModule === 'ALL' ? 'GLOBAL MAX LAG' : `${filterModule} LAG`, value: displayLag.toLocaleString(), color: displayLag > 1000 ? '#d32f2f' : '#212121' },
-              { label: filterSim === 'ALL' ? 'LATEST FLEET ANOMALY SCORE' : 'CURRENT VEHICLE HEALTH', value: `${latestRow?.vehicle_health_score || 0}%`, color: (latestRow?.vehicle_health_score || 100) < 60 ? '#d32f2f' : '#2e7d32' }
+              { label: filterSim === 'ALL' ? 'FLEET AVG VEHICLE HEALTH' : 'CURRENT VEHICLE HEALTH', value: `${filterSim === 'ALL' ? fleetHealthKpi : (latestRow?.vehicle_health_score || 0)}%`, color: ((filterSim === 'ALL' ? fleetHealthKpi : (latestRow?.vehicle_health_score ?? 100)) < 60) ? '#d32f2f' : '#2e7d32' }
             ].map((kpi, idx) => (
               <Paper key={idx} sx={{ flex: 1, p: 2, borderRadius: 0, borderLeft: '4px solid #fbc02d' }}>
                 <Typography variant="caption" sx={{ color: '#757575', fontWeight: 'bold' }}>{kpi.label}</Typography>
@@ -247,7 +251,7 @@ export default function GoldHealth() {
 
           <Box sx={{ display: 'flex', gap: 2, flex: 1, minHeight: 0 }}>
             <Paper sx={{ width: '300px', p: 2, borderRadius: 0, display: 'flex', flexDirection: 'column', overflowY: 'auto' }}>
-              <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161', mb: 2 }}>{filterSim === 'ALL' ? 'LATEST FLEET ANOMALY DRIVERS' : 'LATEST ANOMALY DRIVERS'}</Typography>
+              <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161', mb: 2 }}>{filterSim === 'ALL' ? 'LATEST DEGRADATION DRIVERS (FLEET)' : 'LATEST DEGRADATION DRIVERS'}</Typography>
               {topFeatures.length > 0 ? topFeatures.map((f: any, i) => (
                 <Box key={i} sx={{ mb: 1.5 }}>
                   <Typography variant="body2" sx={{ fontWeight: 'bold', fontSize: '12px' }}>{f.feature}</Typography>
@@ -329,7 +333,7 @@ export default function GoldHealth() {
                 <Legend wrapperStyle={{ fontSize: '12px', fontWeight: 'bold', color: '#616161' }} />
                 
                 {activeModules.map(mod => (
-                  <Line key={`${mod}_raw`} type="monotone" dataKey={`${mod}_raw`} name={`${mod.toUpperCase()} (Raw)`} stroke={COLORS[mod as keyof typeof COLORS]} strokeWidth={1} strokeDasharray="5 5" dot={false} />
+                  <Line key={`${mod}_raw`} type="monotone" dataKey={`${mod}_raw`} name={`${mod.toUpperCase()} MODULE HEALTH`} stroke={COLORS[mod as keyof typeof COLORS]} strokeWidth={1} strokeDasharray="5 5" dot={false} />
                 ))}
 
                 <Line type="monotone" dataKey="experimental_health" name="FUSED VEHICLE HEALTH" stroke="#1976d2" strokeWidth={4} dot={false} activeDot={{ r: 8 }} />
