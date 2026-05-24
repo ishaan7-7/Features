@@ -142,6 +142,16 @@ export default function DashboardInference() {
     });
   }, [inspectorData]);
 
+  const severityChartData = useMemo(() => {
+    if (!metricsData?.module_stats) return [];
+    return Object.entries(metricsData.module_stats).map(([mod, stats]: [string, any]) => ({
+      module: mod,
+      NORMAL: stats.severity_dist?.NORMAL ?? 0,
+      WARNING: stats.severity_dist?.WARNING ?? 0,
+      CRITICAL: stats.severity_dist?.CRITICAL ?? 0,
+    }));
+  }, [metricsData]);
+
   const chartAxisStyle = { fontSize: '11px', fill: '#616161', fontWeight: 600 };
 
   return (
@@ -195,7 +205,7 @@ export default function DashboardInference() {
             </Box>
           </Paper>
 
-          {/* LATENCY COMPARISON CHART */}
+          {/* LATENCY COMPARISON CHART + SEVERITY DISTRIBUTION */}
           <Box sx={{ display: 'flex', gap: 2, height: '240px' }}>
             <Paper sx={{ flex: 1, p: 2, borderRadius: 0, display: 'flex', flexDirection: 'column' }}>
               <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161', mb: 1 }}>E2E VS PURE INFERENCE LATENCY (MS)</Typography>
@@ -208,6 +218,21 @@ export default function DashboardInference() {
                   <Legend wrapperStyle={{ fontSize: '11px', fontWeight: 'bold', color: '#616161' }} />
                   <Bar dataKey="e2e_latency" name="Total E2E Latency" fill="#e0e0e0" barSize={30} isAnimationActive={false} />
                   <Bar dataKey="inf_latency" name="PyTorch Compute Latency" fill="#1976d2" barSize={30} isAnimationActive={false} />
+                </BarChart>
+              </ResponsiveContainer>
+            </Paper>
+            <Paper sx={{ flex: 1, p: 2, borderRadius: 0, display: 'flex', flexDirection: 'column' }}>
+              <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161', mb: 1 }}>SEVERITY DISTRIBUTION BY MODULE (LAST 5M)</Typography>
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={severityChartData} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#eeeeee" />
+                  <XAxis dataKey="module" tick={chartAxisStyle} axisLine={{ stroke: '#bdbdbd' }} tickLine={false} />
+                  <YAxis tick={chartAxisStyle} axisLine={{ stroke: '#bdbdbd' }} tickLine={false} unit="%" domain={[0, 100]} />
+                  <Tooltip cursor={{ fill: '#f5f5f5' }} contentStyle={{ borderRadius: 0, fontSize: '12px', padding: '5px' }} formatter={(v: number) => `${v}%`} />
+                  <Legend wrapperStyle={{ fontSize: '11px', fontWeight: 'bold', color: '#616161' }} />
+                  <Bar dataKey="NORMAL" name="Normal" stackId="a" fill="#2e7d32" barSize={30} isAnimationActive={false} />
+                  <Bar dataKey="WARNING" name="Warning" stackId="a" fill="#f57c00" barSize={30} isAnimationActive={false} />
+                  <Bar dataKey="CRITICAL" name="Critical" stackId="a" fill="#d32f2f" barSize={30} isAnimationActive={false} />
                 </BarChart>
               </ResponsiveContainer>
             </Paper>

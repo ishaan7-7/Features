@@ -28,16 +28,23 @@ const fetchWriterMetrics = async () => {
 
 const fetchInspectorData = async (module: string) => {
   const { data } = await axios.get(`http://127.0.0.1:8005/api/writer/inspector/${module}`);
-  return data.data; 
+  return data.data;
+};
+
+const fetchObserverSnapshot = async () => {
+  const { data } = await axios.get('http://127.0.0.1:8005/api/observer/snapshot');
+  return data;
 };
 
 export default function WriterOps() {
   const { autoRefresh } = useStore();
   
-  const [viewMode, setViewMode] = useState<'operations' | 'inspector'>('operations');
+  const [viewMode, setViewMode] = useState<'operations' | 'inspector' | 'live'>('operations');
   const [selectedModule, setSelectedModule] = useState<string>('engine');
   const [filterModule, setFilterModule] = useState<string>('ALL');
   const [filterSim, setFilterSim] = useState<string>('ALL');
+  const [inspectorVid, setInspectorVid] = useState<string>('');
+  const [inspectorSource, setInspectorSource] = useState<string>('ALL (Latest)');
 
   const { data: metricsData, isLoading: metricsLoading, isError: metricsError } = useQuery({
     queryKey: ['writerMetrics'],
@@ -49,7 +56,14 @@ export default function WriterOps() {
     queryKey: ['writerInspector', selectedModule],
     queryFn: () => fetchInspectorData(selectedModule),
     enabled: viewMode === 'inspector',
-    refetchInterval: false, 
+    refetchInterval: false,
+  });
+
+  const { data: observerData } = useQuery({
+    queryKey: ['observerSnapshot'],
+    queryFn: fetchObserverSnapshot,
+    enabled: viewMode === 'live',
+    refetchInterval: (viewMode === 'live' && autoRefresh) ? 1500 : false,
   });
 
   const metricsRowData = useMemo(() => {
@@ -142,6 +156,32 @@ export default function WriterOps() {
     }));
   }, [inspectorData]);
 
+  const observerVehicles: any[] = observerData?.vehicles || [];
+  const observerHealth = observerData?.system_health || {};
+  const observerGlobal = observerData?.global_stats || { total_rows: 0, active_vehicles: 0, avg_latency: 0, dlq_backlog: 0 };
+
+  if (observerVehicles.length > 0 && !inspectorVid) {
+    setInspectorVid(observerVehicles[0].vehicle_id);
+  }
+
+  const selectedInspectorV = observerVehicles.find((v: any) => v.vehicle_id === inspectorVid) || observerVehicles[0];
+  const availableInspectorSources = ['ALL (Latest)', ...(selectedInspectorV?.module_payloads ? Object.keys(selectedInspectorV.module_payloads) : [])];
+
+  const observerColDefs = useMemo<ColDef[]>(() => [
+    { field: 'vehicle_id', headerName: 'VEHICLE ID', flex: 1, minWidth: 150, cellStyle: { fontWeight: 'bold', color: '#1976d2' } as any },
+    { field: 'rows_processed', headerName: 'PROCESSED', flex: 1, type: 'numericColumn', valueFormatter: (p: any) => p.value?.toLocaleString() },
+    { field: 'rejected_rows', headerName: 'REJECTED', flex: 1, type: 'numericColumn', cellStyle: { color: '#d32f2f' } as any },
+    {
+      field: 'validation_rate',
+      headerName: 'QUALITY SCORE',
+      flex: 1,
+      valueFormatter: (p: any) => p.value != null ? `${p.value.toFixed(1)}%` : '',
+      cellStyle: (p: any) => ({ color: p.value > 95 ? '#2e7d32' : '#d32f2f', fontWeight: 'bold' }),
+    },
+    { field: 'avg_latency', headerName: 'LATENCY (ms)', flex: 1, type: 'numericColumn', valueFormatter: (p: any) => p.value?.toFixed(1) },
+    { field: 'last_seen_sec', headerName: 'LAST SEEN', flex: 1, valueFormatter: (p: any) => p.value != null ? `${p.value.toFixed(1)}s ago` : '' },
+  ], []);
+
   // Custom styling for charts to look "industrial"
   const chartAxisStyle = { fontSize: '11px', fill: '#616161', fontWeight: 600 };
 
@@ -157,6 +197,7 @@ export default function WriterOps() {
           <ToggleButtonGroup value={viewMode} exclusive onChange={(e, val) => val && setViewMode(val)} size="small" sx={{ bgcolor: 'white' }}>
             <ToggleButton value="operations" sx={{ fontWeight: 'bold', px: 3, borderRadius: 0 }}>OPERATIONS METRICS</ToggleButton>
             <ToggleButton value="inspector" sx={{ fontWeight: 'bold', px: 3, borderRadius: 0 }}>DATA INSPECTOR</ToggleButton>
+            <ToggleButton value="live" sx={{ fontWeight: 'bold', px: 3, borderRadius: 0 }}>LIVE STREAM MONITOR</ToggleButton>
           </ToggleButtonGroup>
         </Box>
       </Box>
@@ -280,6 +321,102 @@ export default function WriterOps() {
             />
           </Box>
         </Paper>
+      )}
+
+      {viewMode === 'live' && (
+        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2, flex: 1, minHeight: 0, overflow: 'auto' }}>
+          <Box sx={{ display: 'flex', gap: 2 }}>
+            <Paper sx={{ p: 2, borderRadius: 0, display: 'flex', gap: 2, flexWrap: 'wrap', flex: 1.5, borderLeft: '4px solid #1976d2' }}>
+              {Object.entries(observerHealth).map(([name, isUp]: [string, any]) => (
+                <Chip key={name} label={name.toUpperCase()} color={isUp ? 'success' : 'error'} size="small" variant={isUp ? 'outlined' : 'filled'} sx={{ borderRadius: '2px', fontWeight: 'bold' }} />
+              ))}
+              {Object.keys(observerHealth).length === 0 && <Typography variant="caption" color="textSecondary">AWAITING HEALTH DATA</Typography>}
+            </Paper>
+            {[
+              { label: 'TOTAL THROUGHPUT', value: observerGlobal.total_rows.toLocaleString() },
+              { label: 'ACTIVE FLEET', value: observerGlobal.active_vehicles },
+              { label: 'DLQ BACKLOG', value: observerGlobal.dlq_backlog, color: observerGlobal.dlq_backlog > 0 ? '#d32f2f' : '#212121' },
+            ].map((kpi, idx) => (
+              <Paper key={idx} sx={{ flex: 1, p: 2, borderRadius: 0, borderLeft: '4px solid #424242' }}>
+                <Typography variant="caption" sx={{ color: '#757575', fontWeight: 'bold' }}>{kpi.label}</Typography>
+                <Typography variant="h5" sx={{ fontWeight: 'bold', color: kpi.color || '#212121', mt: 0.5 }}>{kpi.value}</Typography>
+              </Paper>
+            ))}
+          </Box>
+
+          <Paper sx={{ display: 'flex', flexDirection: 'column', p: 0, borderRadius: 0, minHeight: '180px', maxHeight: '220px' }}>
+            <Box sx={{ p: 1, borderBottom: '1px solid #e0e0e0', bgcolor: '#fafafa' }}>
+              <Typography variant="body2" sx={{ fontWeight: 'bold', ml: 1, color: '#424242' }}>LIVE VEHICLE STATUS:</Typography>
+            </Box>
+            <Box className="ag-theme-balham" sx={{ flexGrow: 1, width: '100%' }}>
+              <AgGridReact
+                rowData={observerVehicles}
+                columnDefs={observerColDefs}
+                animateRows={false}
+                rowSelection="single"
+                defaultColDef={{ resizable: true, sortable: true }}
+                overlayNoRowsTemplate='<span class="ag-overlay-loading-center">No Stream Data Available</span>'
+              />
+            </Box>
+          </Paper>
+
+          <Box sx={{ display: 'flex', gap: 2, height: '220px' }}>
+            <Paper sx={{ flex: 1, p: 2, borderRadius: 0, display: 'flex', flexDirection: 'column' }}>
+              <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161', mb: 1 }}>LATENCY BY VEHICLE (ms)</Typography>
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={observerVehicles} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#eeeeee" />
+                  <XAxis dataKey="vehicle_id" tick={chartAxisStyle} axisLine={{ stroke: '#bdbdbd' }} tickLine={false} />
+                  <YAxis tick={chartAxisStyle} axisLine={{ stroke: '#bdbdbd' }} tickLine={false} />
+                  <Tooltip cursor={{ fill: '#f5f5f5' }} contentStyle={{ borderRadius: 0, fontSize: '12px', padding: '5px' }} />
+                  <Bar dataKey="avg_latency" name="Avg Latency (ms)" fill="#fbc02d" barSize={30} isAnimationActive={false} />
+                </BarChart>
+              </ResponsiveContainer>
+            </Paper>
+            <Paper sx={{ flex: 1, p: 2, borderRadius: 0, display: 'flex', flexDirection: 'column' }}>
+              <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161', mb: 1 }}>DATA QUALITY DISTRIBUTION</Typography>
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={observerVehicles} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#eeeeee" />
+                  <XAxis dataKey="vehicle_id" tick={chartAxisStyle} axisLine={{ stroke: '#bdbdbd' }} tickLine={false} />
+                  <YAxis tick={chartAxisStyle} axisLine={{ stroke: '#bdbdbd' }} tickLine={false} />
+                  <Tooltip cursor={{ fill: '#f5f5f5' }} contentStyle={{ borderRadius: 0, fontSize: '12px', padding: '5px' }} />
+                  <Legend wrapperStyle={{ fontSize: '12px' }} />
+                  <Bar dataKey="rows_processed" name="Accepted" stackId="a" fill="#2e7d32" barSize={30} isAnimationActive={false} />
+                  <Bar dataKey="rejected_rows" name="Rejected" stackId="a" fill="#c62828" barSize={30} isAnimationActive={false} />
+                </BarChart>
+              </ResponsiveContainer>
+            </Paper>
+          </Box>
+
+          <Paper sx={{ display: 'flex', flexDirection: 'column', p: 2, borderRadius: 0 }}>
+            <Box sx={{ display: 'flex', gap: 2, mb: 2 }}>
+              <FormControl size="small" sx={{ minWidth: 200, bgcolor: 'white' }}>
+                <InputLabel>Target Vehicle</InputLabel>
+                <Select value={inspectorVid} onChange={(e) => { setInspectorVid(e.target.value); setInspectorSource('ALL (Latest)'); }} label="Target Vehicle" sx={{ borderRadius: 0 }}>
+                  {observerVehicles.map((v: any) => <MenuItem key={v.vehicle_id} value={v.vehicle_id}>{v.vehicle_id}</MenuItem>)}
+                </Select>
+              </FormControl>
+              <FormControl size="small" sx={{ minWidth: 200, bgcolor: 'white' }}>
+                <InputLabel>Payload Source</InputLabel>
+                <Select value={inspectorSource} onChange={(e) => setInspectorSource(e.target.value)} label="Payload Source" sx={{ borderRadius: 0 }}>
+                  {availableInspectorSources.map((src: string) => <MenuItem key={src} value={src}>{src}</MenuItem>)}
+                </Select>
+              </FormControl>
+            </Box>
+            <Box sx={{ bgcolor: '#fafafa', border: '1px solid #e0e0e0', p: 2, maxHeight: '200px', overflow: 'auto' }}>
+              <pre style={{ margin: 0, color: '#37474f', fontFamily: 'Consolas, monospace', fontSize: '12px', whiteSpace: 'pre-wrap', wordWrap: 'break-word' }}>
+                {(() => {
+                  if (!selectedInspectorV) return '// NO DATA FOR TARGET VEHICLE';
+                  const payload = inspectorSource === 'ALL (Latest)'
+                    ? selectedInspectorV.latest_payload
+                    : selectedInspectorV.module_payloads?.[inspectorSource];
+                  return payload ? JSON.stringify(payload, null, 2) : '// WAITING FOR PACKET...';
+                })()}
+              </pre>
+            </Box>
+          </Paper>
+        </Box>
       )}
     </Box>
   );
