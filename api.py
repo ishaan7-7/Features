@@ -2,8 +2,10 @@ import os
 import json
 import asyncio
 import pandas as pd
+from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from deltalake import DeltaTable
 
 # --- Paths & Constants ---
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -66,38 +68,43 @@ def _sync_update_metrics():
             except: pass
 
         dfs_by_mod = {}
+        mod_latest_ts = {}
         for mod in VEHICLE_MODULES:
             path = os.path.join(SILVER_ROOT, mod)
             if not os.path.exists(path): continue
 
             files = []
             for r, d, f in os.walk(path):
+                if "_delta_log" in r:
+                    continue
                 for file in f:
                     if file.endswith(".parquet"):
                         files.append(os.path.join(r, file))
             files.sort(key=os.path.getmtime, reverse=True)
 
             dfs = []
-            for f in files[:5]: # Check top 5 recent parquets
+            mod_max = pd.Timestamp("1970-01-01", tz="UTC")
+            for f in files[:5]:
                 try:
                     df = pd.read_parquet(f)
                     if not df.empty and 'inference_ts' in df.columns:
                         df['inference_ts'] = pd.to_datetime(df['inference_ts'], utc=True)
                         max_df_ts = df['inference_ts'].max()
-                        if max_df_ts > latest_ts: 
+                        if max_df_ts > latest_ts:
                             latest_ts = max_df_ts
+                        if max_df_ts > mod_max:
+                            mod_max = max_df_ts
                         dfs.append(df)
                 except: pass
             if dfs:
                 dfs_by_mod[mod] = pd.concat(dfs, ignore_index=True)
+                mod_latest_ts[mod] = mod_max
 
-        # Apply the 5-minute window anchored to the latest recorded data
-        cutoff_dt = latest_ts - pd.Timedelta(minutes=5)
-        
         recent_alerts = []
+        global_cutoff = latest_ts - pd.Timedelta(minutes=5)
         for a in all_alerts:
             try:
-                if pd.to_datetime(a['timestamp'], utc=True) >= cutoff_dt:
+                if pd.to_datetime(a['timestamp'], utc=True) >= global_cutoff:
                     recent_alerts.append(a)
             except: pass
         recent_alerts.sort(key=lambda x: x['timestamp'], reverse=True)
@@ -109,7 +116,8 @@ def _sync_update_metrics():
         inf_list = []
 
         for mod, combined_df in dfs_by_mod.items():
-            combined_df = combined_df[combined_df['inference_ts'] >= cutoff_dt]
+            mod_cutoff = mod_latest_ts.get(mod, latest_ts) - pd.Timedelta(minutes=5)
+            combined_df = combined_df[combined_df['inference_ts'] >= mod_cutoff]
             if combined_df.empty: continue
 
             combined_df['ingest_ts'] = pd.to_datetime(combined_df.get('ingest_ts', pd.NaT), utc=True)
@@ -164,43 +172,22 @@ def get_inference_metrics():
 def get_inference_tail(module: str):
     if module not in VEHICLE_MODULES:
         raise HTTPException(status_code=400, detail="Invalid module")
-        
-    path = os.path.join(SILVER_ROOT, module)
-    if not os.path.exists(path): return {"data": []}
-        
-    files = []
-    for root, _, filenames in os.walk(path):
-        if "_delta_log" in root:
-            continue
-        for f in filenames:
-            if f.endswith(".parquet"):
-                files.append(os.path.join(root, f))
-
-    if not files: return {"data": []}
-    files.sort(key=os.path.getmtime, reverse=True)
-    
-    data_frames = []
+    path = Path(SILVER_ROOT) / module
+    if not path.exists():
+        return {"data": []}
     try:
-        for f in files[:10]: 
-            df = pd.read_parquet(f)
-            if not df.empty:
-                data_frames.append(df)
-                
-        if not data_frames:
+        if not DeltaTable.is_deltatable(path.as_posix()):
             return {"data": []}
-            
-        combined_df = pd.concat(data_frames, ignore_index=True)
-        if "inference_ts" in combined_df.columns:
-            combined_df["inference_ts"] = pd.to_datetime(combined_df["inference_ts"]).astype(str)
-            combined_df = combined_df.sort_values("inference_ts", ascending=False)
-            
-        combined_df = combined_df.fillna(0)
-        # Handle timezone-aware/naive datetimes correctly
-        for col in combined_df.select_dtypes(include=['datetime64[ns]', 'datetime64[ns, UTC]']).columns:
-            combined_df[col] = combined_df[col].astype(str)
-            
-        return {"data": combined_df.head(100).to_dict(orient="records")}
-        
+        df = DeltaTable(path.as_posix()).to_pyarrow_dataset().to_table().to_pandas()
+        if df.empty:
+            return {"data": []}
+        if "inference_ts" in df.columns:
+            df["inference_ts"] = pd.to_datetime(df["inference_ts"]).astype(str)
+            df = df.sort_values("inference_ts", ascending=False)
+        df = df.fillna(0)
+        for col in df.select_dtypes(include=['datetime64[ns]', 'datetime64[ns, UTC]']).columns:
+            df[col] = df[col].astype(str)
+        return {"data": df.head(100).to_dict(orient="records")}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
