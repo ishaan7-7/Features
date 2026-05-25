@@ -1,8 +1,8 @@
 import React, { useMemo, useState, useEffect } from 'react';
-import { 
-  Box, Typography, Paper, Select, MenuItem, FormControl, InputLabel, 
-  ToggleButton, ToggleButtonGroup, Divider, Checkbox, FormControlLabel, 
-  Slider, Button, Alert, Chip
+import {
+  Box, Typography, Paper, Select, MenuItem, FormControl, InputLabel,
+  ToggleButton, ToggleButtonGroup, Divider, Checkbox, FormControlLabel,
+  Slider, Button, Alert, Chip, TextField, IconButton
 } from '@mui/material';
 import { AgGridReact } from 'ag-grid-react';
 import type { ColDef } from 'ag-grid-community';
@@ -12,19 +12,120 @@ import 'ag-grid-community/styles/ag-theme-balham.css';
 import { useQuery } from '@tanstack/react-query';
 import axios from 'axios';
 import { useStore } from '../store';
-import { 
-  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer 
+import {
+  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer
 } from 'recharts';
 import AutoFixHighIcon from '@mui/icons-material/AutoFixHigh';
+import DeleteIcon from '@mui/icons-material/Delete';
+import CompareArrowsIcon from '@mui/icons-material/CompareArrows';
 
 ModuleRegistry.registerModules([ClientSideRowModelModule]);
 
 const ALL_MODULES = ["engine", "transmission", "battery", "body", "tyre"];
 const COLORS = { engine: '#e57373', transmission: '#ffb74d', battery: '#81c784', body: '#ba68c8', tyre: '#4dd0e1' };
 
+const BUILTIN_PRESETS: Record<string, Record<string, number>> = {
+  'Safety-First':     { engine: 0.40, transmission: 0.20, battery: 0.25, body: 0.05, tyre: 0.10 },
+  'Drivetrain-Heavy': { engine: 0.45, transmission: 0.35, battery: 0.10, body: 0.05, tyre: 0.05 },
+  'Equal-Weight':     { engine: 0.20, transmission: 0.20, battery: 0.20, body: 0.20, tyre: 0.20 },
+};
+
 const fetchGoldMetrics = async () => (await axios.get('http://127.0.0.1:8005/api/gold/metrics')).data;
 const fetchGoldConfig = async () => (await axios.get('http://127.0.0.1:8005/api/gold/config')).data;
 const fetchGoldHistory = async (simId: string) => (await axios.get(`http://127.0.0.1:8005/api/gold/history/${simId}`)).data.data;
+
+interface WeightPanelProps {
+  label: string;
+  profile: 'A' | 'B';
+  weights: Record<string, number>;
+  modules: string[];
+  weightSum: number;
+  isImbalanced: boolean;
+  allPresets: Record<string, Record<string, number>>;
+  savedPresets: Record<string, Record<string, number>>;
+  onWeightChange: (mod: string, val: number) => void;
+  onToggleModule: (mod: string) => void;
+  onAutoBalance: () => void;
+  onApplyPreset: (name: string, profile: 'A' | 'B') => void;
+  onSavePreset: (name: string, weights: Record<string, number>, modules: string[]) => void;
+  onDeletePreset: (name: string) => void;
+}
+
+function WeightPanel({
+  label, profile, weights, modules, weightSum, isImbalanced,
+  allPresets, savedPresets, onWeightChange, onToggleModule, onAutoBalance,
+  onApplyPreset, onSavePreset, onDeletePreset,
+}: WeightPanelProps) {
+  const [selectedPreset, setSelectedPreset] = useState('');
+  const [saveAsName, setSaveAsName] = useState('');
+
+  return (
+    <Box sx={{ display: 'flex', flexDirection: 'column', height: '100%', overflowY: 'auto' }}>
+      <Typography variant="subtitle2" sx={{ fontWeight: 800, color: '#212121', mb: 1 }}>{label}</Typography>
+
+      <Box sx={{ display: 'flex', gap: 1, mb: 1.5, alignItems: 'center' }}>
+        <FormControl size="small" sx={{ flex: 1 }}>
+          <Select value={selectedPreset} onChange={e => setSelectedPreset(e.target.value)} displayEmpty sx={{ borderRadius: 0, fontSize: '12px' }}>
+            <MenuItem value=""><em>— Select Preset —</em></MenuItem>
+            {Object.keys(allPresets).map(name => (
+              <MenuItem key={name} value={name} sx={{ fontSize: '12px' }}>{name}</MenuItem>
+            ))}
+          </Select>
+        </FormControl>
+        <Button size="small" variant="outlined" onClick={() => { if (selectedPreset) onApplyPreset(selectedPreset, profile); }}
+          disabled={!selectedPreset} sx={{ borderRadius: 0, fontWeight: 'bold', fontSize: '11px', minWidth: 50, height: 32 }}>
+          APPLY
+        </Button>
+        {selectedPreset && savedPresets[selectedPreset] && (
+          <IconButton size="small" onClick={() => { onDeletePreset(selectedPreset); setSelectedPreset(''); }} sx={{ borderRadius: 0, p: 0.5 }}>
+            <DeleteIcon fontSize="small" />
+          </IconButton>
+        )}
+      </Box>
+
+      {isImbalanced && (
+        <Alert severity="warning" icon={false} sx={{ borderRadius: 0, mb: 1.5, '& .MuiAlert-message': { p: 0 } }}
+          action={<Button size="small" color="inherit" onClick={onAutoBalance} startIcon={<AutoFixHighIcon />}>RECALIBRATE</Button>}>
+          <Typography variant="caption" sx={{ fontWeight: 'bold', display: 'block' }}>
+            Sum: {weightSum.toFixed(3)} (Target: 1.0)
+          </Typography>
+        </Alert>
+      )}
+
+      <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2.5 }}>
+        {ALL_MODULES.map(mod => {
+          const isActive = modules.includes(mod);
+          return (
+            <Box key={mod} sx={{ opacity: isActive ? 1 : 0.5 }}>
+              <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <FormControlLabel
+                  control={<Checkbox size="small" checked={isActive} onChange={() => onToggleModule(mod)}
+                    sx={{ color: COLORS[mod as keyof typeof COLORS] }} />}
+                  label={<Typography variant="body2" sx={{ fontWeight: 'bold', textTransform: 'uppercase', fontSize: '12px' }}>{mod}</Typography>}
+                />
+                <Chip size="small" label={isActive ? (weights[mod] || 0).toFixed(2) : 'OFF'}
+                  sx={{ borderRadius: 1, height: '20px', fontSize: '11px', fontWeight: 'bold' }} />
+              </Box>
+              <Slider size="small" value={weights[mod] || 0} onChange={(_, val) => onWeightChange(mod, val as number)}
+                min={0} max={1} step={0.01} disabled={!isActive}
+                sx={{ color: COLORS[mod as keyof typeof COLORS], ml: 4, width: 'calc(100% - 32px)', mt: -1 }} />
+            </Box>
+          );
+        })}
+      </Box>
+
+      <Box sx={{ mt: 2.5, pt: 1.5, borderTop: '1px solid #e0e0e0', display: 'flex', gap: 1 }}>
+        <TextField size="small" label="Save as preset..." value={saveAsName} onChange={e => setSaveAsName(e.target.value)}
+          sx={{ flex: 1, '& .MuiInputBase-root': { borderRadius: 0 }, '& .MuiInputBase-input': { fontSize: '12px' } }} />
+        <Button size="small" variant="contained" disableElevation
+          onClick={() => { onSavePreset(saveAsName, weights, modules); setSaveAsName(''); }}
+          disabled={!saveAsName.trim()} sx={{ borderRadius: 0, fontWeight: 'bold', fontSize: '11px' }}>
+          SAVE
+        </Button>
+      </Box>
+    </Box>
+  );
+}
 
 export default function GoldHealth() {
   const { autoRefresh } = useStore();
@@ -35,12 +136,20 @@ export default function GoldHealth() {
   const [filterSim, setFilterSim] = useState<string>('ALL');
   const [filterModule, setFilterModule] = useState<string>('ALL');
 
-  // Experimentation State
+  // Experimentation State — Profile A
   const [activeModules, setActiveModules] = useState<string[]>([]);
   const [expWeights, setExpWeights] = useState<Record<string, number>>({});
 
+  // Experimentation State — Profile B (A/B mode)
+  const [profileMode, setProfileMode] = useState<'single' | 'ab'>('single');
+  const [activeModulesB, setActiveModulesB] = useState<string[]>([]);
+  const [expWeightsB, setExpWeightsB] = useState<Record<string, number>>({});
+  const [savedPresets, setSavedPresets] = useState<Record<string, Record<string, number>>>(() => {
+    try { return JSON.parse(localStorage.getItem('gold_weight_presets') || '{}'); } catch { return {}; }
+  });
+
   // Queries
-  const { data: metrics } = useQuery({ queryKey: ['goldMetrics'], queryFn: fetchGoldMetrics, refetchInterval: autoRefresh ? 2000 : false });
+  const { data: metrics } = useQuery({ queryKey: ['goldMetrics'], queryFn: fetchGoldMetrics, refetchInterval: (activeTab === 'operations' && autoRefresh) ? 2000 : false });
   const { data: config } = useQuery({ queryKey: ['goldConfig'], queryFn: fetchGoldConfig, refetchInterval: false });
   
   const availableSims = useMemo(() => metrics?.active_sims || [], [metrics]);
@@ -57,6 +166,68 @@ export default function GoldHealth() {
       setExpWeights(config.default_weights || {});
     }
   }, [config]);
+
+  useEffect(() => {
+    if (config && activeModulesB.length === 0) {
+      setActiveModulesB(config.enabled_modules || ALL_MODULES);
+      setExpWeightsB(config.default_weights || {});
+    }
+  }, [config]);
+
+  // --- PRESET MANAGEMENT ---
+  const allPresets = useMemo(() => ({ ...BUILTIN_PRESETS, ...savedPresets }), [savedPresets]);
+
+  const applyPreset = (name: string, profile: 'A' | 'B') => {
+    const w = allPresets[name];
+    if (!w) return;
+    if (profile === 'A') {
+      setExpWeights(prev => ({ ...prev, ...w }));
+      setActiveModules(ALL_MODULES.filter(m => (w[m] || 0) > 0));
+    } else {
+      setExpWeightsB(prev => ({ ...prev, ...w }));
+      setActiveModulesB(ALL_MODULES.filter(m => (w[m] || 0) > 0));
+    }
+  };
+
+  const savePreset = (name: string, weights: Record<string, number>, modules: string[]) => {
+    if (!name.trim()) return;
+    const toSave: Record<string, number> = {};
+    modules.forEach(m => { toSave[m] = weights[m] || 0; });
+    setSavedPresets(prev => {
+      const updated = { ...prev, [name.trim()]: toSave };
+      localStorage.setItem('gold_weight_presets', JSON.stringify(updated));
+      return updated;
+    });
+  };
+
+  const deletePreset = (name: string) => {
+    setSavedPresets(prev => {
+      const { [name]: _, ...rest } = prev;
+      localStorage.setItem('gold_weight_presets', JSON.stringify(rest));
+      return rest;
+    });
+  };
+
+  // --- PROFILE B WEIGHT HANDLERS ---
+  const handleToggleModuleB = (mod: string) => {
+    setActiveModulesB(prev => prev.includes(mod) ? prev.filter(m => m !== mod) : [...prev, mod]);
+  };
+  const handleWeightChangeB = (mod: string, val: number) => {
+    setExpWeightsB(prev => ({ ...prev, [mod]: val }));
+  };
+  const currentWeightSumB = useMemo(
+    () => activeModulesB.reduce((sum, mod) => sum + (expWeightsB[mod] || 0), 0),
+    [activeModulesB, expWeightsB]
+  );
+  const isUnbalancedB = Math.abs(currentWeightSumB - 1.0) > 0.001;
+  const autoBalanceWeightsB = () => {
+    if (currentWeightSumB === 0) return;
+    const balanced: Record<string, number> = {};
+    activeModulesB.forEach(mod => {
+      balanced[mod] = parseFloat(((expWeightsB[mod] || 0) / currentWeightSumB).toFixed(3));
+    });
+    setExpWeightsB(prev => ({ ...prev, ...balanced }));
+  };
 
   const fleetHealthKpi = useMemo(() => {
     if (!history || history.length === 0) return 0;
@@ -147,6 +318,46 @@ export default function GoldHealth() {
 
     return processedRows;
   }, [history, config, activeModules, expWeights, filterSim]);
+
+  // --- PROFILE B SIMULATION ---
+  const simulatedHistoryB = useMemo(() => {
+    if (profileMode !== 'ab' || !history || !config) return [];
+    const processedRows = history.map((row: any) => {
+      let simulatedHealth = 0;
+      const parsedRow: any = { ...row, ts_short: row.gold_window_ts };
+      activeModulesB.forEach(mod => {
+        const rawHealth = row[`${mod}_contrib`] || 0;
+        parsedRow[`${mod}_raw_b`] = rawHealth;
+        simulatedHealth += rawHealth * (expWeightsB[mod] || 0);
+      });
+      parsedRow.profile_b_health = parseFloat(simulatedHealth.toFixed(2));
+      return parsedRow;
+    });
+    if (filterSim === 'ALL') {
+      const grouped: Record<string, any> = {};
+      processedRows.forEach((row: any) => {
+        if (!grouped[row.ts_short]) grouped[row.ts_short] = { count: 0, profile_b_health: 0 };
+        grouped[row.ts_short].count += 1;
+        grouped[row.ts_short].profile_b_health += row.profile_b_health;
+      });
+      return Object.keys(grouped).map(ts => ({
+        ts_short: ts,
+        profile_b_health: parseFloat((grouped[ts].profile_b_health / grouped[ts].count).toFixed(2)),
+      })).sort((a, b) => a.ts_short.localeCompare(b.ts_short));
+    }
+    return processedRows;
+  }, [history, config, activeModulesB, expWeightsB, filterSim, profileMode]);
+
+  const mergedChartData = useMemo(() => {
+    if (profileMode !== 'ab') return simulatedHistory;
+    const bMap: Record<string, number> = {};
+    simulatedHistoryB.forEach((row: any) => { bMap[row.ts_short] = row.profile_b_health; });
+    return simulatedHistory.map((row: any) => ({
+      ...row,
+      actual_gold: row.vehicle_health_score ?? null,
+      profile_b_health: bMap[row.ts_short] ?? null,
+    }));
+  }, [profileMode, simulatedHistory, simulatedHistoryB]);
 
   // --- OPERATIONS BOARD DATA ---
   const reversedHistory = useMemo(() => (history ? [...history].reverse() : []), [history]);
@@ -280,66 +491,96 @@ export default function GoldHealth() {
 
       {/* TAB 2: WEIGHT EXPERIMENTATION LAB */}
       {activeTab === 'experiment' && (
-        <Box sx={{ display: 'flex', gap: 2, flex: 1, minHeight: 0 }}>
-          
-          <Paper sx={{ width: '320px', p: 2, borderRadius: 0, display: 'flex', flexDirection: 'column', overflowY: 'auto', bgcolor: 'white' }}>
-            <Typography variant="subtitle2" sx={{ fontWeight: 800, color: '#212121', mb: 2 }}>DYNAMIC WEIGHT CONFIG</Typography>
-            
-            {isUnbalanced && (
-              <Alert 
-                severity="warning" icon={false} sx={{ borderRadius: 0, mb: 2, '& .MuiAlert-message': { p: 0 } }}
-                action={<Button size="small" color="inherit" onClick={autoBalanceWeights} startIcon={<AutoFixHighIcon />}>RECALIBRATE</Button>}
-              >
-                <Typography variant="caption" sx={{ fontWeight: 'bold', display: 'block' }}>Sum is {currentWeightSum.toFixed(3)} (Target: 1.0)</Typography>
-              </Alert>
+        <Box sx={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0, gap: 2 }}>
+
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+            <Typography variant="body2" sx={{ fontWeight: 'bold', color: '#424242' }}>SIMULATION MODE:</Typography>
+            <ToggleButtonGroup value={profileMode} exclusive onChange={(_, val) => val && setProfileMode(val)} size="small" sx={{ bgcolor: 'white' }}>
+              <ToggleButton value="single" sx={{ fontWeight: 'bold', px: 2, borderRadius: 0, fontSize: '12px' }}>SINGLE PROFILE</ToggleButton>
+              <ToggleButton value="ab" sx={{ fontWeight: 'bold', px: 2, borderRadius: 0, fontSize: '12px' }}>
+                <CompareArrowsIcon sx={{ fontSize: 16, mr: 0.5 }} />A/B COMPARISON
+              </ToggleButton>
+            </ToggleButtonGroup>
+          </Box>
+
+          <Box sx={{ display: 'flex', gap: 2, flex: 1, minHeight: 0 }}>
+
+            <Paper sx={{ width: profileMode === 'ab' ? '280px' : '320px', p: 2, borderRadius: 0, display: 'flex', flexDirection: 'column', borderTop: '3px solid #1976d2' }}>
+              <WeightPanel
+                label={profileMode === 'ab' ? 'PROFILE A' : 'DYNAMIC WEIGHT CONFIG'}
+                profile="A"
+                weights={expWeights}
+                modules={activeModules}
+                weightSum={currentWeightSum}
+                isImbalanced={isUnbalanced}
+                allPresets={allPresets}
+                savedPresets={savedPresets}
+                onWeightChange={handleWeightChange}
+                onToggleModule={handleToggleModule}
+                onAutoBalance={autoBalanceWeights}
+                onApplyPreset={applyPreset}
+                onSavePreset={savePreset}
+                onDeletePreset={deletePreset}
+              />
+            </Paper>
+
+            {profileMode === 'ab' && (
+              <Paper sx={{ width: '280px', p: 2, borderRadius: 0, display: 'flex', flexDirection: 'column', borderTop: '3px solid #7b1fa2' }}>
+                <WeightPanel
+                  label="PROFILE B"
+                  profile="B"
+                  weights={expWeightsB}
+                  modules={activeModulesB}
+                  weightSum={currentWeightSumB}
+                  isImbalanced={isUnbalancedB}
+                  allPresets={allPresets}
+                  savedPresets={savedPresets}
+                  onWeightChange={handleWeightChangeB}
+                  onToggleModule={handleToggleModuleB}
+                  onAutoBalance={autoBalanceWeightsB}
+                  onApplyPreset={applyPreset}
+                  onSavePreset={savePreset}
+                  onDeletePreset={deletePreset}
+                />
+              </Paper>
             )}
 
-            <Box sx={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
-              {ALL_MODULES.map(mod => {
-                const isActive = activeModules.includes(mod);
-                return (
-                  <Box key={mod} sx={{ opacity: isActive ? 1 : 0.5 }}>
-                    <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                      <FormControlLabel
-                        control={<Checkbox size="small" checked={isActive} onChange={() => handleToggleModule(mod)} sx={{ color: COLORS[mod as keyof typeof COLORS] }} />}
-                        label={<Typography variant="body2" sx={{ fontWeight: 'bold', textTransform: 'uppercase' }}>{mod}</Typography>}
-                      />
-                      <Chip size="small" label={isActive ? (expWeights[mod] || 0).toFixed(2) : 'OFF'} sx={{ borderRadius: 1, height: '20px', fontSize: '11px', fontWeight: 'bold' }} />
-                    </Box>
-                    <Slider 
-                      size="small" value={expWeights[mod] || 0} onChange={(_, val) => handleWeightChange(mod, val as number)}
-                      min={0} max={1} step={0.01} disabled={!isActive}
-                      sx={{ color: COLORS[mod as keyof typeof COLORS], ml: 4, width: 'calc(100% - 32px)', mt: -1 }}
-                    />
-                  </Box>
-                );
-              })}
-            </Box>
-          </Paper>
-
-          <Paper sx={{ flex: 1, p: 2, borderRadius: 0, display: 'flex', flexDirection: 'column' }}>
-            <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 2 }}>
-              <Typography variant="subtitle2" sx={{ fontWeight: 800, color: '#212121' }}>
+            <Paper sx={{ flex: 1, p: 2, borderRadius: 0, display: 'flex', flexDirection: 'column' }}>
+              <Typography variant="subtitle2" sx={{ fontWeight: 800, color: '#212121', mb: 2 }}>
                 {filterSim === 'ALL' ? 'FLEET-WIDE AVERAGED HEALTH TRAJECTORY' : `RECALCULATED HEALTH TRAJECTORY: ${filterSim}`}
+                {profileMode === 'ab' && ' — A/B COMPARISON'}
               </Typography>
-            </Box>
-            
-            <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={simulatedHistory} margin={{ top: 10, right: 30, left: -20, bottom: 0 }}>
-                <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#eeeeee" />
-                <XAxis dataKey="ts_short" tick={chartAxisStyle} axisLine={{ stroke: '#bdbdbd' }} tickLine={false} minTickGap={30} />
-                <YAxis domain={[0, 100]} tick={chartAxisStyle} axisLine={{ stroke: '#bdbdbd' }} tickLine={false} />
-                <Tooltip contentStyle={{ borderRadius: 0, fontSize: '12px', padding: '10px' }} />
-                <Legend wrapperStyle={{ fontSize: '12px', fontWeight: 'bold', color: '#616161' }} />
-                
-                {activeModules.map(mod => (
-                  <Line key={`${mod}_raw`} type="monotone" dataKey={`${mod}_raw`} name={`${mod.toUpperCase()} MODULE HEALTH`} stroke={COLORS[mod as keyof typeof COLORS]} strokeWidth={1} strokeDasharray="5 5" dot={false} />
-                ))}
 
-                <Line type="monotone" dataKey="experimental_health" name="FUSED VEHICLE HEALTH" stroke="#1976d2" strokeWidth={4} dot={false} activeDot={{ r: 8 }} />
-              </LineChart>
-            </ResponsiveContainer>
-          </Paper>
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart data={mergedChartData} margin={{ top: 10, right: 30, left: -20, bottom: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#eeeeee" />
+                  <XAxis dataKey="ts_short" tick={chartAxisStyle} axisLine={{ stroke: '#bdbdbd' }} tickLine={false} minTickGap={30} />
+                  <YAxis domain={[0, 100]} tick={chartAxisStyle} axisLine={{ stroke: '#bdbdbd' }} tickLine={false} />
+                  <Tooltip contentStyle={{ borderRadius: 0, fontSize: '12px', padding: '10px' }} />
+                  <Legend wrapperStyle={{ fontSize: '12px', fontWeight: 'bold', color: '#616161' }} />
+
+                  {profileMode === 'single' && activeModules.map(mod => (
+                    <Line key={`${mod}_raw`} type="monotone" dataKey={`${mod}_raw`} name={`${mod.toUpperCase()} MODULE HEALTH`}
+                      stroke={COLORS[mod as keyof typeof COLORS]} strokeWidth={1} strokeDasharray="5 5" dot={false} />
+                  ))}
+
+                  {profileMode === 'ab' && (
+                    <Line type="monotone" dataKey="actual_gold" name="ACTUAL GOLD" stroke="#9e9e9e"
+                      strokeWidth={1.5} strokeDasharray="4 4" dot={false} />
+                  )}
+
+                  <Line type="monotone" dataKey="experimental_health"
+                    name={profileMode === 'ab' ? 'PROFILE A' : 'FUSED VEHICLE HEALTH'}
+                    stroke="#1976d2" strokeWidth={4} dot={false} activeDot={{ r: 8 }} />
+
+                  {profileMode === 'ab' && (
+                    <Line type="monotone" dataKey="profile_b_health" name="PROFILE B"
+                      stroke="#7b1fa2" strokeWidth={4} dot={false} activeDot={{ r: 8 }} />
+                  )}
+                </LineChart>
+              </ResponsiveContainer>
+            </Paper>
+          </Box>
         </Box>
       )}
     </Box>
