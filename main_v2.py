@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import aiohttp
 from fastapi import FastAPI, Request, HTTPException
@@ -27,12 +28,13 @@ app.add_middleware(
 
 # --- Microservice Registry ---
 SERVICES = {
-    "writer": "http://127.0.0.1:8001",
+    "writer":    "http://127.0.0.1:8001",
     "inference": "http://127.0.0.1:8002",
-    "gold": "http://127.0.0.1:8003",
-    "alerts": "http://127.0.0.1:8004",
-    "dtc": "http://127.0.0.1:8007",
-    "observer": "http://127.0.0.1:8006"
+    "gold":      "http://127.0.0.1:8003",
+    "alerts":    "http://127.0.0.1:8004",
+    "observer":  "http://127.0.0.1:8006",
+    "dtc":       "http://127.0.0.1:8007",
+    "analytics": "http://127.0.0.1:8008",
 }
 
 # --- Generic Proxy Forwarder ---
@@ -83,7 +85,7 @@ async def get_writer_metrics(request: Request):
 
 @app.get("/api/writer/inspector/{module}")
 async def get_writer_inspector(module: str, request: Request):
-    return await proxy_request("writer", f"/api/writer/inspector/{module}", request, fallback_data={"data": []})
+    return await proxy_request("writer", f"/api/writer/inspector/{module}", request, fallback_data={"data": []}, timeout=60)
 
 # 2. Inference Ops
 @app.get("/api/inference/metrics")
@@ -96,7 +98,7 @@ async def get_inference_metrics(request: Request):
 
 @app.get("/api/inference/tail/{module}")
 async def get_inference_tail(module: str, request: Request):
-    return await proxy_request("inference", f"/api/inference/tail/{module}", request, fallback_data={"data": []})
+    return await proxy_request("inference", f"/api/inference/tail/{module}", request, fallback_data={"data": []}, timeout=60)
 
 # 3. Gold Health
 @app.get("/api/gold/metrics")
@@ -110,7 +112,7 @@ async def get_gold_config(request: Request):
 
 @app.get("/api/gold/history/{sim_id}")
 async def get_gold_history(sim_id: str, request: Request):
-    return await proxy_request("gold", f"/api/gold/history/{sim_id}", request, fallback_data={"data": []})
+    return await proxy_request("gold", f"/api/gold/history/{sim_id}", request, fallback_data={"data": []}, timeout=60)
 
 # 4. Alerts & DTC
 @app.get("/api/alerts/metrics")
@@ -131,6 +133,77 @@ async def get_observer_snapshot(request: Request):
         "vehicles": []
     }
     return await proxy_request("observer", "/api/observer/snapshot", request, fallback_data=fallback)
+
+# 6. Analytics
+@app.get("/api/heartbeat")
+async def get_heartbeat(request: Request):
+    return await proxy_request("analytics", "/api/heartbeat", request, fallback_data={"seq": 0, "layers": {}})
+
+@app.get("/api/fleet/current-status")
+async def get_fleet_current_status(request: Request):
+    return await proxy_request("analytics", "/api/fleet/current-status", request, fallback_data={"vehicles": [], "count": 0})
+
+@app.get("/api/fleet/health-trend")
+async def get_fleet_health_trend(request: Request):
+    return await proxy_request("analytics", "/api/fleet/health-trend", request, fallback_data={"vehicles": []})
+
+@app.get("/api/fleet/alerts-summary")
+async def get_fleet_alerts_summary(request: Request):
+    return await proxy_request("analytics", "/api/fleet/alerts-summary", request,
+                               fallback_data={"open_count": 0, "closed_count": 0, "open": [], "closed": []})
+
+@app.get("/api/vehicle/{sim_id}/profile")
+async def get_vehicle_profile(sim_id: str, request: Request):
+    return await proxy_request("analytics", f"/api/vehicle/{sim_id}/profile", request,
+                               fallback_data={"sim_id": sim_id, "vehicle_health": 0, "modules": {}, "top_features": {}})
+
+@app.get("/api/vehicle/{sim_id}/gold-history")
+async def get_vehicle_gold_history(sim_id: str, request: Request):
+    return await proxy_request("analytics", f"/api/vehicle/{sim_id}/gold-history", request,
+                               fallback_data={"sim_id": sim_id, "data": []})
+
+@app.get("/api/vehicle/{sim_id}/silver-history/{module}")
+async def get_vehicle_silver_history(sim_id: str, module: str, request: Request):
+    return await proxy_request("analytics", f"/api/vehicle/{sim_id}/silver-history/{module}", request,
+                               fallback_data={"sim_id": sim_id, "module": module, "data": []})
+
+@app.get("/api/vehicle/{sim_id}/alerts")
+async def get_vehicle_alerts(sim_id: str, request: Request):
+    return await proxy_request("analytics", f"/api/vehicle/{sim_id}/alerts", request,
+                               fallback_data={"sim_id": sim_id, "total": 0, "data": []})
+
+@app.get("/api/module/{module}/fleet-health")
+async def get_module_fleet_health(module: str, request: Request):
+    return await proxy_request("analytics", f"/api/module/{module}/fleet-health", request,
+                               fallback_data={"module": module, "vehicles": []})
+
+@app.get("/api/module/{module}/sensor-history/{sim_id}")
+async def get_module_sensor_history(module: str, sim_id: str, request: Request):
+    return await proxy_request("analytics", f"/api/module/{module}/sensor-history/{sim_id}", request,
+                               fallback_data={"ts": [], "values": []}, timeout=30)
+
+@app.get("/api/module/{module}/sensor-fleet-history")
+async def get_module_sensor_fleet_history(module: str, request: Request):
+    return await proxy_request("analytics", f"/api/module/{module}/sensor-fleet-history", request,
+                               fallback_data={"data": []}, timeout=30)
+
+@app.get("/api/module/{module}/sensor-stats/{sim_id}")
+async def get_module_sensor_stats(module: str, sim_id: str, request: Request):
+    return await proxy_request("analytics", f"/api/module/{module}/sensor-stats/{sim_id}", request,
+                               fallback_data={"stats": {}}, timeout=30)
+
+@app.get("/api/module/{module}/feature-importance")
+async def get_module_feature_importance(module: str, request: Request):
+    return await proxy_request("analytics", f"/api/module/{module}/feature-importance", request,
+                               fallback_data={"features": []})
+
+@app.get("/api/dtc/history")
+async def get_dtc_history(request: Request):
+    return await proxy_request("analytics", "/api/dtc/history", request, fallback_data={"total": 0, "data": []})
+
+@app.get("/api/dtc/latest")
+async def get_dtc_latest(request: Request):
+    return await proxy_request("analytics", "/api/dtc/latest", request, fallback_data={"entry": None})
 
 import sys as _sys, os as _os
 _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))

@@ -1,21 +1,20 @@
 import React, { useMemo, useState, useEffect } from 'react';
 import {
   Box, Typography, Paper, Select, MenuItem, FormControl, InputLabel,
-  ToggleButton, ToggleButtonGroup, Button, Chip, CircularProgress,
+  ToggleButton, ToggleButtonGroup, Chip,
 } from '@mui/material';
 import { AgGridReact } from 'ag-grid-react';
 import type { ColDef } from 'ag-grid-community';
 import { ClientSideRowModelModule, ModuleRegistry } from 'ag-grid-community';
 import 'ag-grid-community/styles/ag-grid.css';
 import 'ag-grid-community/styles/ag-theme-balham.css';
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useQuery } from '@tanstack/react-query';
 import axios from 'axios';
 import { useStore } from '../store';
 import {
   LineChart, Line, BarChart, Bar, XAxis, YAxis, CartesianGrid,
   Tooltip, Legend, ResponsiveContainer, ReferenceLine,
 } from 'recharts';
-import PresentToAllIcon from '@mui/icons-material/PresentToAll';
 
 ModuleRegistry.registerModules([ClientSideRowModelModule]);
 
@@ -204,8 +203,7 @@ function SensorChart({
 }
 
 export default function AutomotiveDive() {
-  const { autoRefresh, presentationMode, setPresentationMode } = useStore();
-  const queryClient = useQueryClient();
+  const { autoRefresh } = useStore();
 
   const [activeTab, setActiveTab] = useState<PageTab>('fleet');
   const [xAxisMode, setXAxisMode] = useState<XAxisMode>('timestamp');
@@ -213,21 +211,6 @@ export default function AutomotiveDive() {
   const [selectedModule, setSelectedModule] = useState<string>('engine');
   const [analysisModule, setAnalysisModule] = useState<string>('engine');
   const [analysisKey, setAnalysisKey] = useState<string>('');
-
-  const demoMutation = useMutation({
-    mutationFn: () => axios.post(`${API}/api/automotive/demo/activate`),
-    onSuccess: () => {
-      setPresentationMode(true);
-      queryClient.invalidateQueries({ queryKey: ['demoStatus'] });
-      queryClient.invalidateQueries({ queryKey: ['autoFleetSummary'] });
-    },
-  });
-
-  const demoStatusQuery = useQuery({
-    queryKey: ['demoStatus'],
-    queryFn: () => axios.get(`${API}/api/automotive/demo/status`).then((r) => r.data),
-    refetchInterval: 10000,
-  });
 
   const fleetQuery = useQuery({
     queryKey: ['autoFleetSummary'],
@@ -253,7 +236,6 @@ export default function AutomotiveDive() {
     refetchInterval: autoRefresh ? 5000 : false,
   });
 
-  // GOLD — fused vehicle health trend with demo fallback
   const vehicleHealthQuery = useQuery({
     queryKey: ['autoVehicleHealth', selectedVehicle],
     queryFn: () =>
@@ -272,10 +254,6 @@ export default function AutomotiveDive() {
   });
 
   useEffect(() => {
-    if (demoStatusQuery.data?.active && !presentationMode) setPresentationMode(true);
-  }, [demoStatusQuery.data]);
-
-  useEffect(() => {
     const vehicles = fleetQuery.data?.vehicles;
     if (vehicles?.length > 0 && !selectedVehicle) setSelectedVehicle(vehicles[0].vehicle_id);
   }, [fleetQuery.data]);
@@ -290,7 +268,6 @@ export default function AutomotiveDive() {
 
   // BRONZE derived
   const sensorData: any[] = sensorQuery.data?.data || [];
-  const bronzeDataSource: string = sensorQuery.data?.data_source || 'none';
   const latestBronzeRow: any = sensorData.length > 0 ? sensorData[sensorData.length - 1] : null;
   const downsampledBronze = useMemo(() => {
     const factor = Math.max(1, Math.floor(sensorData.length / 400));
@@ -374,7 +351,6 @@ export default function AutomotiveDive() {
     [],
   );
 
-  const isDemoActive = presentationMode || demoStatusQuery.data?.active;
   const chartGroups = MODULE_CHART_GROUPS[selectedModule] || [];
   const kpiFields = MODULE_KPI_FIELDS[selectedModule] || [];
 
@@ -383,19 +359,9 @@ export default function AutomotiveDive() {
 
       {/* ── HEADER ── */}
       <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end', borderBottom: '2px solid #bdbdbd', pb: 1, flexWrap: 'wrap', gap: 1 }}>
-        <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
-          <Typography variant="h5" sx={{ fontWeight: 700, color: '#212121', letterSpacing: '-0.5px' }}>
-            AUTOMOTIVE DEEP DIVE
-          </Typography>
-          {isDemoActive && (
-            <Chip label="PRESENTATION MODE: ACTIVE" size="small"
-              sx={{ borderRadius: 0, fontWeight: 'bold', bgcolor: '#1976d2', color: 'white', fontSize: '11px' }} />
-          )}
-          {bronzeDataSource === 'demo' && (
-            <Chip label="DEMO DATA" size="small"
-              sx={{ borderRadius: 0, fontWeight: 'bold', bgcolor: '#ed6c02', color: 'white', fontSize: '11px' }} />
-          )}
-        </Box>
+        <Typography variant="h5" sx={{ fontWeight: 700, color: '#212121', letterSpacing: '-0.5px' }}>
+          AUTOMOTIVE DEEP DIVE
+        </Typography>
         <Box sx={{ display: 'flex', gap: 1.5, alignItems: 'center', flexWrap: 'wrap' }}>
           <ToggleButtonGroup value={activeTab} exclusive onChange={(_e, val) => val && setActiveTab(val)} size="small" sx={{ bgcolor: 'white' }}>
             <ToggleButton value="fleet" sx={{ fontWeight: 'bold', px: 2, borderRadius: 0, fontSize: '12px' }}>FLEET OVERVIEW</ToggleButton>
@@ -407,16 +373,6 @@ export default function AutomotiveDive() {
             <ToggleButton value="timestamp" sx={{ fontWeight: 'bold', px: 1.5, borderRadius: 0, fontSize: '11px' }}>TIMESTAMP</ToggleButton>
             <ToggleButton value="mileage" sx={{ fontWeight: 'bold', px: 1.5, borderRadius: 0, fontSize: '11px' }}>MILEAGE</ToggleButton>
           </ToggleButtonGroup>
-
-          <Button
-            variant="contained" size="small"
-            startIcon={demoMutation.isPending ? <CircularProgress size={12} color="inherit" /> : <PresentToAllIcon />}
-            disabled={isDemoActive || demoMutation.isPending}
-            onClick={() => demoMutation.mutate()}
-            sx={{ borderRadius: 0, bgcolor: isDemoActive ? '#388e3c' : '#1976d2', fontWeight: 'bold', fontSize: '11px', '&:hover': { bgcolor: '#1565c0' } }}
-          >
-            {demoMutation.isPending ? 'SEEDING 10-DAY HISTORY…' : isDemoActive ? 'DEMO: ACTIVE' : 'ACTIVATE DEMO MODE'}
-          </Button>
         </Box>
       </Box>
 
@@ -424,14 +380,10 @@ export default function AutomotiveDive() {
       {activeTab === 'fleet' && (
         <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2, flex: 1, minHeight: 0 }}>
           {!fleetQuery.isLoading && vehicles.length === 0 && (
-            <Box sx={{ p: 3, bgcolor: '#e3f2fd', border: '1px solid #90caf9', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-              <Typography variant="body2" sx={{ fontWeight: 'bold', color: '#1565c0' }}>
-                No live vehicle data found. Activate demo mode to explore 10-day synthetic vehicle history.
+            <Box sx={{ p: 2, bgcolor: '#fff8e1', border: '1px solid #ffe082' }}>
+              <Typography variant="body2" sx={{ color: '#e65100', fontWeight: 'bold' }}>
+                No vehicle data. Start the streaming pipeline to populate fleet data.
               </Typography>
-              <Button variant="contained" size="small" startIcon={<PresentToAllIcon />} onClick={() => demoMutation.mutate()}
-                disabled={demoMutation.isPending} sx={{ borderRadius: 0, fontWeight: 'bold', ml: 2, whiteSpace: 'nowrap' }}>
-                {demoMutation.isPending ? 'SEEDING...' : 'ACTIVATE DEMO MODE'}
-              </Button>
             </Box>
           )}
           <Box sx={{ display: 'flex', gap: 2 }}>
