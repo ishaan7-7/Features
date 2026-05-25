@@ -243,7 +243,17 @@ def _attach_mileage(combined, vehicle_id: str):
         )
         merged = merged.drop(columns=["_comb_ts"])
         combined = merged
-        combined["mileage"] = combined["odometer_reading"].fillna(0)
+        if combined.get("odometer_reading") is not None and combined["odometer_reading"].notna().any():
+            combined["mileage"] = combined["odometer_reading"].ffill().bfill().fillna(0)
+        else:
+            odo_min = float(body_merged["odometer_reading"].min())
+            odo_max = float(body_merged["odometer_reading"].max())
+            n = len(combined)
+            if n > 1 and odo_max > odo_min:
+                step = (odo_max - odo_min) / (n - 1)
+                combined["mileage"] = [round(odo_min + step * i, 1) for i in range(n)]
+            else:
+                combined["mileage"] = odo_min
     else:
         combined["mileage"] = range(len(combined))
     return combined
@@ -482,10 +492,12 @@ def get_automotive_vehicle_health_history(vehicle_id: str):
                 combined["gold_window_ts"] = pd.to_datetime(combined["gold_window_ts"])
                 combined = combined.sort_values("gold_window_ts")
                 combined["ts"] = combined["gold_window_ts"].dt.strftime("%Y-%m-%d %H:%M")
+            combined["timestamp"] = combined["ts"]
+            combined = _attach_mileage(combined, vehicle_id)
             combined = combined.fillna(0)
             for col in combined.select_dtypes(include=["datetime64[ns]", "datetime64[ns, UTC]"]).columns:
                 combined[col] = combined[col].astype(str)
-            keep = [c for c in ("ts", "vehicle_health_score") if c in combined.columns]
+            keep = [c for c in ("ts", "vehicle_health_score", "mileage") if c in combined.columns]
             keep += [c for c in combined.columns if c.endswith("_contrib")]
             out = combined[keep].tail(2000).rename(columns={"vehicle_health_score": "health"})
             rows = out.to_dict(orient="records")

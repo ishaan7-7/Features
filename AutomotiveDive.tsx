@@ -313,6 +313,7 @@ export default function AutomotiveDive() {
     return sampled.map((r: any) => ({
       ts: r.ts || String(r.timestamp || '').slice(5, 16),
       health: r.health,
+      mileage: r.mileage ?? 0,
     }));
   }, [vehicleHealthQuery.data]);
 
@@ -492,7 +493,7 @@ export default function AutomotiveDive() {
                 <ResponsiveContainer width="100%" height="100%">
                   <LineChart data={healthHistory} margin={{ top: 4, right: 15, left: -25, bottom: 0 }}>
                     <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#eeeeee" />
-                    <XAxis dataKey="ts" tick={axisStyle} axisLine={{ stroke: '#bdbdbd' }} tickLine={false} minTickGap={40} tickFormatter={(v) => formatXTick(v, 'timestamp')} />
+                    <XAxis dataKey={xAxisMode === 'mileage' ? 'mileage' : 'ts'} tick={axisStyle} axisLine={{ stroke: '#bdbdbd' }} tickLine={false} minTickGap={40} tickFormatter={(v) => formatXTick(v, xAxisMode)} />
                     <YAxis domain={[0, 100]} tick={axisStyle} axisLine={{ stroke: '#bdbdbd' }} tickLine={false} />
                     <Tooltip contentStyle={{ borderRadius: 0, fontSize: '11px' }} formatter={(v: number) => `${v.toFixed(1)}%`} />
                     <ReferenceLine y={60} stroke="#d32f2f" strokeDasharray="4 4" />
