@@ -1,4 +1,5 @@
 import React, { useMemo, useState, useEffect } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import {
   Box, Typography, Paper, Select, MenuItem, FormControl, InputLabel,
   ToggleButton, ToggleButtonGroup, Chip,
@@ -206,11 +207,16 @@ function SensorChart({
 
 export default function AutomotiveDive() {
   const { autoRefresh } = useStore();
+  const [searchParams] = useSearchParams();
 
-  const [activeTab, setActiveTab] = useState<PageTab>('fleet');
+  const _initVehicle = searchParams.get('vehicle') || '';
+  const _initModule = searchParams.get('module') || 'engine';
+  const _initTab = searchParams.get('tab') as PageTab | null;
+
+  const [activeTab, setActiveTab] = useState<PageTab>(_initTab === 'vehicle' || _initTab === 'module' ? _initTab : 'fleet');
   const [xAxisMode, setXAxisMode] = useState<XAxisMode>('timestamp');
-  const [selectedVehicle, setSelectedVehicle] = useState<string>('');
-  const [selectedModule, setSelectedModule] = useState<string>('engine');
+  const [selectedVehicle, setSelectedVehicle] = useState<string>(_initVehicle);
+  const [selectedModule, setSelectedModule] = useState<string>(ALL_MODULES.includes(_initModule) ? _initModule : 'engine');
   const [analysisModule, setAnalysisModule] = useState<string>('engine');
   const [analysisKey, setAnalysisKey] = useState<string>('');
 
