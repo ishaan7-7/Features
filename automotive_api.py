@@ -206,24 +206,23 @@ def _seed_all_demo_data() -> None:
 
 def _attach_mileage(combined, vehicle_id: str):
     import pandas as pd
-    body_path = os.path.join(_DELTA_ROOT, "body")
-    if not os.path.exists(body_path):
+    body_partition = os.path.join(_DELTA_ROOT, "body", f"source_id={vehicle_id}")
+    if not os.path.exists(body_partition):
         combined["mileage"] = range(len(combined))
         return combined
     bfiles = sorted(
-        [os.path.join(r, f) for r, _d, ff in os.walk(body_path) for f in ff if f.endswith(".parquet")],
+        [os.path.join(r, f) for r, _d, ff in os.walk(body_partition) for f in ff if f.endswith(".parquet")],
         key=os.path.getmtime, reverse=True,
     )
     bdfs = []
     for fp in bfiles[:20]:
         try:
             bdf = pd.read_parquet(fp)
-            if not bdf.empty and "source_id" in bdf.columns and "odometer_reading" in bdf.columns:
-                vbdf = bdf[bdf["source_id"] == vehicle_id].copy()
-                btc = next((c for c in ("timestamp", "ingest_ts") if c in vbdf.columns), None)
+            if not bdf.empty and "odometer_reading" in bdf.columns:
+                btc = next((c for c in ("timestamp", "ingest_ts") if c in bdf.columns), None)
                 if btc:
-                    vbdf["timestamp"] = pd.to_datetime(vbdf[btc]).dt.strftime("%Y-%m-%d %H:%M")
-                    bdfs.append(vbdf[["timestamp", "odometer_reading"]])
+                    bdf["timestamp"] = pd.to_datetime(bdf[btc]).dt.strftime("%Y-%m-%d %H:%M")
+                    bdfs.append(bdf[["timestamp", "odometer_reading"]])
         except Exception:
             pass
     if bdfs:
@@ -346,25 +345,24 @@ def get_automotive_sensor_history(vehicle_id: str, module: str):
     rows: list = []
     data_source = "none"
 
-    bronze_path = os.path.join(_DELTA_ROOT, module)
-    if os.path.exists(bronze_path):
+    partition_path = os.path.join(_DELTA_ROOT, module, f"source_id={vehicle_id}")
+    if os.path.exists(partition_path):
         pfiles = sorted(
-            [os.path.join(r, f) for r, _d, ff in os.walk(bronze_path) for f in ff if f.endswith(".parquet")],
+            [os.path.join(r, f) for r, _d, ff in os.walk(partition_path) for f in ff if f.endswith(".parquet")],
             key=os.path.getmtime, reverse=True,
         )
         dfs = []
         for fp in pfiles[:20]:
             try:
                 df = pd.read_parquet(fp)
-                if not df.empty and "source_id" in df.columns:
-                    vdf = df[df["source_id"] == vehicle_id]
-                    if not vdf.empty:
-                        dfs.append(vdf)
+                if not df.empty:
+                    dfs.append(df)
             except Exception:
                 pass
 
         if dfs:
             combined = pd.concat(dfs, ignore_index=True)
+            combined["source_id"] = vehicle_id
             ts_col = next((c for c in ("timestamp", "ingest_ts") if c in combined.columns), None)
             if ts_col:
                 combined["timestamp"] = pd.to_datetime(combined[ts_col]).dt.strftime("%Y-%m-%d %H:%M")
@@ -449,9 +447,12 @@ def get_automotive_vehicle_health_history(vehicle_id: str):
     data_source = "none"
 
     if os.path.exists(_GOLD_ROOT):
-        gfiles = [os.path.join(r, f) for r, _d, ff in os.walk(_GOLD_ROOT) for f in ff if f.endswith(".parquet")]
+        gfiles = sorted(
+            [os.path.join(r, f) for r, _d, ff in os.walk(_GOLD_ROOT) for f in ff if f.endswith(".parquet")],
+            key=os.path.getmtime, reverse=True,
+        )
         dfs = []
-        for fp in gfiles:
+        for fp in gfiles[:100]:
             try:
                 df = pd.read_parquet(fp)
                 if not df.empty and "source_id" in df.columns:
@@ -494,29 +495,37 @@ def get_automotive_module_crossfleet(module: str):
 
     bronze_path = os.path.join(_DELTA_ROOT, module)
     if os.path.exists(bronze_path):
-        pfiles = sorted(
-            [os.path.join(r, f) for r, _d, ff in os.walk(bronze_path) for f in ff if f.endswith(".parquet")],
-            key=os.path.getmtime, reverse=True,
-        )
-        dfs = []
-        for fp in pfiles[:30]:
-            try:
-                df = pd.read_parquet(fp)
-                if not df.empty:
-                    dfs.append(df)
-            except Exception:
-                pass
-        if dfs:
-            combined = pd.concat(dfs, ignore_index=True)
-            if "source_id" in combined.columns:
-                for vid, grp in combined.groupby("source_id"):
-                    stat: dict = {"vehicle_id": str(vid)}
-                    for sk in sensor_keys:
-                        if sk in grp.columns:
-                            stat[f"{sk}_avg"] = round(float(grp[sk].mean()), 3)
-                            stat[f"{sk}_min"] = round(float(grp[sk].min()), 3)
-                            stat[f"{sk}_max"] = round(float(grp[sk].max()), 3)
-                    vehicle_stats.append(stat)
+        try:
+            part_dirs = sorted([
+                d for d in os.listdir(bronze_path)
+                if d.startswith("source_id=") and os.path.isdir(os.path.join(bronze_path, d))
+            ])
+        except Exception:
+            part_dirs = []
+        for part_dir in part_dirs:
+            vid = part_dir[len("source_id="):]
+            part_path = os.path.join(bronze_path, part_dir)
+            pfiles = sorted(
+                [os.path.join(r, f) for r, _d, ff in os.walk(part_path) for f in ff if f.endswith(".parquet")],
+                key=os.path.getmtime, reverse=True,
+            )
+            vdfs = []
+            for fp in pfiles[:5]:
+                try:
+                    df = pd.read_parquet(fp)
+                    if not df.empty:
+                        vdfs.append(df)
+                except Exception:
+                    pass
+            if vdfs:
+                grp = pd.concat(vdfs, ignore_index=True)
+                stat: dict = {"vehicle_id": vid}
+                for sk in sensor_keys:
+                    if sk in grp.columns:
+                        stat[f"{sk}_avg"] = round(float(grp[sk].mean()), 3)
+                        stat[f"{sk}_min"] = round(float(grp[sk].min()), 3)
+                        stat[f"{sk}_max"] = round(float(grp[sk].max()), 3)
+                vehicle_stats.append(stat)
 
     if not vehicle_stats and _PRESENTATION_MODE_ACTIVE and _DEMO_SEED_CACHE:
         for vid in _DEMO_VEHICLES:
