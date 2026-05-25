@@ -835,75 +835,40 @@ export default function AutomotiveDive() {
             </Paper>
           </Box>
 
-          {/* ── ROW C: Anomaly driver trends + Severity distribution donut ── */}
-          <Box sx={{ display: 'flex', gap: 2 }}>
-            <Paper sx={{ flex: 2, p: 1.5, borderRadius: 0, height: 280, display: 'flex', flexDirection: 'column' }}>
-              <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161', mb: 0.5 }}>
-                ANOMALY DRIVER TRENDS — SHAP FEATURE IMPORTANCE OVER TIME &nbsp;
-                <span style={{ color: '#9e9e9e', fontWeight: 'normal' }}>({selectedModule.toUpperCase()} SILVER)</span>
+          {/* ── ROW C: Anomaly driver trends — small multiples grid ── */}
+          <Paper sx={{ p: 1.5, borderRadius: 0 }}>
+            <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 1 }}>
+              <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161' }}>
+                ANOMALY DRIVER TRENDS — TOP SHAP FEATURES &nbsp;
+                <span style={{ color: '#9e9e9e', fontWeight: 'normal' }}>({selectedModule.toUpperCase()} SILVER · one chart per feature)</span>
               </Typography>
-              <Box sx={{ flex: 1, minHeight: 0 }}>
-                {anomalyTrendData.length > 0 && anomalyTrendSeries.length > 0 ? (
-                  <ResponsiveContainer width="100%" height="100%">
-                    <LineChart data={anomalyTrendData} margin={{ top: 4, right: 15, left: -25, bottom: 0 }}>
-                      <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#eeeeee" />
-                      <XAxis dataKey={xAxisMode === 'mileage' ? 'mileage' : 'ts'} tick={axisStyle} axisLine={{ stroke: '#bdbdbd' }} tickLine={false} minTickGap={50} tickFormatter={(v) => formatXTick(v, xAxisMode)} />
-                      <YAxis domain={[0, 1]} tick={axisStyle} axisLine={{ stroke: '#bdbdbd' }} tickLine={false} tickFormatter={(v: number) => v.toFixed(1)} />
-                      <Tooltip contentStyle={{ borderRadius: 0, fontSize: '10px', padding: '4px 8px' }} formatter={(v: any, name: any) => [Number(v).toFixed(3), String(name).replace(/_/g, ' ')]} />
-                      <Legend wrapperStyle={{ fontSize: '9px', fontWeight: 'bold' }} formatter={(value: any) => String(value).replace(/_/g, ' ').slice(0, 22)} />
-                      {anomalyTrendSeries.map((feature, i) => (
-                        <Line key={feature} type="monotone" dataKey={feature} name={feature} stroke={SHAP_COLORS[i] || '#9e9e9e'} strokeWidth={1.5} dot={false} isAnimationActive={false} />
-                      ))}
-                    </LineChart>
-                  </ResponsiveContainer>
-                ) : (
-                  <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%' }}>
-                    <Typography variant="caption" sx={{ color: '#9e9e9e' }}>No SHAP data in silver history</Typography>
-                  </Box>
-                )}
+              {anomalyTrendSeries.length > 0 && (
+                <Typography variant="caption" sx={{ color: '#9e9e9e', fontFamily: 'monospace', fontSize: '10px' }}>
+                  {anomalyTrendSeries.length} drivers · {anomalyTrendData.length} pts
+                </Typography>
+              )}
+            </Box>
+            {anomalyTrendData.length > 0 && anomalyTrendSeries.length > 0 ? (
+              <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 1.5 }}>
+                {anomalyTrendSeries.map((feature, i) => (
+                  <SensorChart
+                    key={feature}
+                    data={anomalyTrendData}
+                    group={{
+                      title: feature.replace(/_/g, ' ').toUpperCase(),
+                      sensors: [{ key: feature, color: SHAP_COLORS[i % SHAP_COLORS.length], label: 'SHAP score' }],
+                    }}
+                    xAxisMode={xAxisMode}
+                    height={170}
+                  />
+                ))}
               </Box>
-            </Paper>
-
-            <Paper sx={{ flex: 1, p: 1.5, borderRadius: 0, height: 280, display: 'flex', flexDirection: 'column' }}>
-              <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161', mb: 0.5 }}>
-                SEVERITY DISTRIBUTION — {selectedModule.toUpperCase()}
-              </Typography>
-              <Box sx={{ flex: 1, minHeight: 0 }}>
-                {moduleHealthData.length > 0 ? (
-                  <ResponsiveContainer width="100%" height="100%">
-                    <PieChart>
-                      <Pie
-                        data={severityDistribution}
-                        dataKey="value"
-                        nameKey="name"
-                        cx="50%"
-                        cy="45%"
-                        innerRadius={52}
-                        outerRadius={78}
-                        isAnimationActive={false}
-                      >
-                        {severityDistribution.map((entry, i) => (
-                          <Cell key={i} fill={entry.color} />
-                        ))}
-                      </Pie>
-                      <Tooltip
-                        contentStyle={{ borderRadius: 0, fontSize: '11px' }}
-                        formatter={(v: any, name: any) => {
-                          const d = severityDistribution.find((x) => x.name === name);
-                          return [`${v} pts (${d?.pct ?? 0}%)`, name];
-                        }}
-                      />
-                      <Legend wrapperStyle={{ fontSize: '10px', fontWeight: 'bold' }} />
-                    </PieChart>
-                  </ResponsiveContainer>
-                ) : (
-                  <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%' }}>
-                    <Typography variant="caption" sx={{ color: '#9e9e9e' }}>No severity data</Typography>
-                  </Box>
-                )}
+            ) : (
+              <Box sx={{ p: 3, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                <Typography variant="caption" sx={{ color: '#9e9e9e' }}>No SHAP data in silver history for this module</Typography>
               </Box>
-            </Paper>
-          </Box>
+            )}
+          </Paper>
 
           {/* ── ROW D: Bronze sensor statistics table ── */}
           <Paper sx={{ p: 1.5, borderRadius: 0 }}>
@@ -979,12 +944,12 @@ export default function AutomotiveDive() {
             {vehicleAlertsQuery.isLoading ? (
               <Typography variant="caption" sx={{ color: '#9e9e9e' }}>Loading…</Typography>
             ) : (
-              <Box sx={{ overflowX: 'auto' }}>
+              <Box sx={{ maxHeight: 320, overflowY: 'auto', overflowX: 'auto', border: '1px solid #e0e0e0' }}>
                 <table style={{ width: '100%', borderCollapse: 'collapse', fontFamily: 'monospace', fontSize: '11px' }}>
                   <thead>
                     <tr style={{ borderBottom: '2px solid #bdbdbd' }}>
                       {['STATUS', 'MODULE', 'STARTED', 'PEAK TS', 'ENDED', 'MAX SCORE', 'TOP FEATURES'].map((h) => (
-                        <th key={h} style={{ textAlign: 'left', padding: '4px 12px', color: '#616161', fontWeight: 700, whiteSpace: 'nowrap' }}>{h}</th>
+                        <th key={h} style={{ textAlign: 'left', padding: '4px 12px', color: '#616161', fontWeight: 700, whiteSpace: 'nowrap', position: 'sticky', top: 0, background: 'white', boxShadow: '0 1px 0 #bdbdbd' }}>{h}</th>
                       ))}
                     </tr>
                   </thead>
