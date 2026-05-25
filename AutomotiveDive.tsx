@@ -13,8 +13,10 @@ import { useQuery } from '@tanstack/react-query';
 import axios from 'axios';
 import { useStore } from '../store';
 import {
-  LineChart, Line, BarChart, Bar, XAxis, YAxis, CartesianGrid,
+  LineChart, Line, BarChart, Bar, AreaChart, Area, XAxis, YAxis, CartesianGrid,
   Tooltip, Legend, ResponsiveContainer, ReferenceLine,
+  RadarChart, Radar, PolarGrid, PolarAngleAxis, PolarRadiusAxis,
+  PieChart, Pie, Cell,
 } from 'recharts';
 
 ModuleRegistry.registerModules([ClientSideRowModelModule]);
@@ -134,6 +136,7 @@ const MODULE_KPI_FIELDS: Record<string, { key: string; label: string; unit: stri
 };
 
 const axisStyle = { fontSize: '10px', fill: '#616161', fontWeight: 600 };
+const SHAP_COLORS = ['#e53935', '#fb8c00', '#8e24aa', '#1e88e5', '#43a047', '#6d4c41'];
 
 function formatXTick(val: string | number, mode: XAxisMode): string {
   if (mode === 'mileage') return `${Math.round(Number(val)).toLocaleString()}`;
@@ -219,6 +222,8 @@ export default function AutomotiveDive() {
   const [selectedModule, setSelectedModule] = useState<string>(ALL_MODULES.includes(_initModule) ? _initModule : 'engine');
   const [analysisModule, setAnalysisModule] = useState<string>('engine');
   const [analysisKey, setAnalysisKey] = useState<string>('');
+  const [dtcResult, setDtcResult] = useState<any>(null);
+  const [dtcRunning, setDtcRunning] = useState(false);
 
   const fleetQuery = useQuery({
     queryKey: ['autoFleetSummary'],
@@ -258,6 +263,20 @@ export default function AutomotiveDive() {
     queryFn: () =>
       axios.get(`${API}/api/automotive/module-crossfleet/${analysisModule}`).then((r) => r.data),
     enabled: activeTab === 'module',
+    refetchInterval: false,
+  });
+
+  const vehicleAlertsQuery = useQuery({
+    queryKey: ['autoVehicleAlerts', selectedVehicle],
+    queryFn: () => axios.get(`${API}/api/automotive/alerts/${selectedVehicle}`).then((r) => r.data),
+    enabled: !!selectedVehicle && activeTab === 'vehicle',
+    refetchInterval: autoRefresh ? 10000 : false,
+  });
+
+  const dtcHistoryQuery = useQuery({
+    queryKey: ['autoDtcHistory', selectedVehicle],
+    queryFn: () => axios.get(`${API}/api/automotive/dtc-history/${selectedVehicle}`).then((r) => r.data),
+    enabled: !!selectedVehicle && activeTab === 'vehicle',
     refetchInterval: false,
   });
 
@@ -377,6 +396,117 @@ export default function AutomotiveDive() {
 
   const chartGroups = MODULE_CHART_GROUPS[selectedModule] || [];
   const kpiFields = MODULE_KPI_FIELDS[selectedModule] || [];
+
+  const runDtcAnalysis = async () => {
+    if (!selectedVehicle) return;
+    const peakTs = vehicleAlertsQuery.data?.open?.[0]?.peak_anomaly_ts
+      || vehicleAlertsQuery.data?.closed?.[0]?.peak_anomaly_ts
+      || latestBronzeRow?.timestamp
+      || new Date().toISOString();
+    setDtcRunning(true);
+    setDtcResult(null);
+    try {
+      const res = await axios.get('http://127.0.0.1:8007/api/dtc/analyze', {
+        params: { module: selectedModule, source_id: selectedVehicle, peak_ts: peakTs },
+        timeout: 60000,
+      });
+      setDtcResult(res.data);
+    } catch {
+      setDtcResult({ error: 'DTC service offline or unreachable (port 8007). Start dtc_service/api.py to enable analysis.' });
+    } finally {
+      setDtcRunning(false);
+    }
+  };
+
+  const decompositionHistory = useMemo(() => {
+    const raw: any[] = vehicleHealthQuery.data?.data || [];
+    const factor = Math.max(1, Math.floor(raw.length / 400));
+    const sampled = factor === 1 ? raw : raw.filter((_: any, i: number) => i % factor === 0);
+    return sampled.map((r: any) => ({
+      ts: r.ts || String(r.timestamp || '').slice(5, 16),
+      mileage: r.mileage ?? 0,
+      ...Object.fromEntries(ALL_MODULES.map((mod) => [mod, Math.round(r[`${mod}_contrib`] ?? 0)])),
+    }));
+  }, [vehicleHealthQuery.data]);
+
+  const radarData = useMemo(() => {
+    const v = vehicles.find((v: any) => v.vehicle_id === selectedVehicle);
+    if (!v) return ALL_MODULES.map((mod) => ({ module: mod.toUpperCase(), score: 0, fullMark: 100 }));
+    return ALL_MODULES.map((mod) => ({
+      module: mod.toUpperCase(),
+      score: Math.round(v[`${mod}_contrib`] ?? 0),
+      fullMark: 100,
+    }));
+  }, [vehicles, selectedVehicle]);
+
+  const { anomalyTrendSeries, anomalyTrendData } = useMemo(() => {
+    const raw: any[] = moduleHealthQuery.data?.data || [];
+    if (!raw.length) return { anomalyTrendSeries: [] as string[], anomalyTrendData: [] as any[] };
+    const featureSet = new Set<string>();
+    raw.forEach((r: any) => parseTopFeatures(r.top_features || '').forEach((f) => featureSet.add(f.feature)));
+    const series = Array.from(featureSet).slice(0, 6);
+    const factor = Math.max(1, Math.floor(raw.length / 300));
+    const sampled = factor === 1 ? raw : raw.filter((_: any, i: number) => i % factor === 0);
+    const data: any[] = sampled.map((r: any) => {
+      const fm: Record<string, number> = {};
+      parseTopFeatures(r.top_features || '').forEach((f) => { fm[f.feature] = f.score; });
+      const row: Record<string, any> = { ts: String(r.timestamp || '').slice(5, 16), mileage: r.mileage ?? 0 };
+      series.forEach((s) => { row[s] = fm[s] ?? 0; });
+      return row;
+    });
+    return { anomalyTrendSeries: series, anomalyTrendData: data };
+  }, [moduleHealthQuery.data]);
+
+  const severityDistribution = useMemo(() => {
+    const raw: any[] = moduleHealthQuery.data?.data || [];
+    const counts: Record<string, number> = { NORMAL: 0, WARNING: 0, CRITICAL: 0 };
+    raw.forEach((r: any) => { const s = r.severity || 'NORMAL'; counts[s] = (counts[s] || 0) + 1; });
+    const total = raw.length || 1;
+    return [
+      { name: 'NORMAL',   value: counts.NORMAL,   pct: Math.round(counts.NORMAL   / total * 100), color: '#2e7d32' },
+      { name: 'WARNING',  value: counts.WARNING,  pct: Math.round(counts.WARNING  / total * 100), color: '#ed6c02' },
+      { name: 'CRITICAL', value: counts.CRITICAL, pct: Math.round(counts.CRITICAL / total * 100), color: '#d32f2f' },
+    ];
+  }, [moduleHealthQuery.data]);
+
+  const severityRuns = useMemo(() => {
+    const raw: any[] = moduleHealthQuery.data?.data || [];
+    if (!raw.length) return [] as { severity: string; count: number; startTs: string; endTs: string }[];
+    type Run = { severity: string; count: number; startTs: string; endTs: string };
+    const runs: Run[] = [];
+    let cur: Run = { severity: raw[0].severity || 'NORMAL', count: 1, startTs: String(raw[0].timestamp || '').slice(5, 16), endTs: '' };
+    for (let i = 1; i < raw.length; i++) {
+      const s = raw[i].severity || 'NORMAL';
+      if (s === cur.severity) {
+        cur.count++;
+      } else {
+        cur.endTs = String(raw[i - 1].timestamp || '').slice(5, 16);
+        runs.push({ ...cur });
+        cur = { severity: s, count: 1, startTs: String(raw[i].timestamp || '').slice(5, 16), endTs: '' };
+      }
+    }
+    cur.endTs = String(raw[raw.length - 1].timestamp || '').slice(5, 16);
+    runs.push(cur);
+    return runs;
+  }, [moduleHealthQuery.data]);
+
+  const sensorStats = useMemo(() => {
+    if (!sensorData.length) return [] as any[];
+    return kpiFields.map((f) => {
+      const vals = sensorData.map((r: any) => Number(r[f.key])).filter((v) => !isNaN(v) && isFinite(v));
+      if (!vals.length) return { ...f, min: null, max: null, mean: null, std: null, latest: null };
+      const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+      const std = Math.sqrt(vals.reduce((a, b) => a + (b - mean) ** 2, 0) / vals.length);
+      return {
+        ...f,
+        min: Math.min(...vals),
+        max: Math.max(...vals),
+        mean,
+        std,
+        latest: latestBronzeRow ? Number(latestBronzeRow[f.key]) : null,
+      };
+    });
+  }, [sensorData, kpiFields, latestBronzeRow]);
 
   return (
     <Box sx={{ height: 'calc(100vh - 80px)', display: 'flex', flexDirection: 'column', gap: 2, p: 2, bgcolor: '#f5f5f5' }}>
@@ -589,6 +719,470 @@ export default function AutomotiveDive() {
               <SensorChart key={group.title} data={downsampledBronze} group={group} xAxisMode={xAxisMode} />
             ))}
           </Box>
+
+          {/* ── SECTION DIVIDER ── */}
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, my: 0.5 }}>
+            <Box sx={{ flex: 1, height: '1px', bgcolor: '#e0e0e0' }} />
+            <Typography variant="caption" sx={{ color: '#9e9e9e', fontWeight: 'bold', fontFamily: 'monospace', letterSpacing: 1, whiteSpace: 'nowrap' }}>
+              HEALTH ANALYTICS
+            </Typography>
+            <Box sx={{ flex: 1, height: '1px', bgcolor: '#e0e0e0' }} />
+          </Box>
+
+          {/* ── ROW A: Health decomposition stacked area ── */}
+          <Paper sx={{ p: 1.5, borderRadius: 0, height: 260, display: 'flex', flexDirection: 'column' }}>
+            <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161', mb: 0.5 }}>
+              HEALTH DECOMPOSITION — ALL MODULE CONTRIBUTIONS OVER TIME &nbsp;
+              <span style={{ color: '#9e9e9e', fontWeight: 'normal' }}>(GOLD)</span>
+            </Typography>
+            <Box sx={{ flex: 1, minHeight: 0 }}>
+              {decompositionHistory.length > 0 ? (
+                <ResponsiveContainer width="100%" height="100%">
+                  <AreaChart data={decompositionHistory} margin={{ top: 4, right: 15, left: -25, bottom: 0 }}>
+                    <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#eeeeee" />
+                    <XAxis dataKey={xAxisMode === 'mileage' ? 'mileage' : 'ts'} tick={axisStyle} axisLine={{ stroke: '#bdbdbd' }} tickLine={false} minTickGap={40} tickFormatter={(v) => formatXTick(v, xAxisMode)} />
+                    <YAxis domain={[0, 100]} tick={axisStyle} axisLine={{ stroke: '#bdbdbd' }} tickLine={false} />
+                    <Tooltip contentStyle={{ borderRadius: 0, fontSize: '11px', padding: '6px 10px' }} formatter={(v: any) => [`${v}%`]} />
+                    <Legend wrapperStyle={{ fontSize: '10px', fontWeight: 'bold', paddingTop: 2 }} />
+                    {ALL_MODULES.map((mod) => (
+                      <Area key={mod} type="monotone" dataKey={mod} name={mod.toUpperCase()} stroke={MODULE_COLORS[mod]} fill={MODULE_COLORS[mod]} fillOpacity={0.15} strokeWidth={1.5} dot={false} isAnimationActive={false} />
+                    ))}
+                  </AreaChart>
+                </ResponsiveContainer>
+              ) : (
+                <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%' }}>
+                  <Typography variant="caption" sx={{ color: '#9e9e9e' }}>No gold history — select a vehicle and load data</Typography>
+                </Box>
+              )}
+            </Box>
+          </Paper>
+
+          {/* ── ROW B: Module health radar + Severity transition strip ── */}
+          <Box sx={{ display: 'flex', gap: 2 }}>
+            <Paper sx={{ width: 290, p: 1.5, borderRadius: 0, height: 280, display: 'flex', flexDirection: 'column', flexShrink: 0 }}>
+              <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161', mb: 0.5 }}>
+                MODULE HEALTH RADAR — {selectedVehicle || '—'}
+              </Typography>
+              <Box sx={{ flex: 1, minHeight: 0 }}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <RadarChart data={radarData} margin={{ top: 10, right: 20, bottom: 10, left: 20 }}>
+                    <PolarGrid stroke="#e0e0e0" />
+                    <PolarAngleAxis dataKey="module" tick={{ fontSize: 10, fontWeight: 700, fill: '#424242', fontFamily: 'monospace' } as any} />
+                    <PolarRadiusAxis angle={90} domain={[0, 100]} tick={false} axisLine={false} />
+                    <Radar name="Health %" dataKey="score" stroke="#1976d2" fill="#1976d2" fillOpacity={0.2} isAnimationActive={false} />
+                    <Tooltip contentStyle={{ borderRadius: 0, fontSize: '11px' }} formatter={(v: any) => [`${v}%`, 'Health']} />
+                  </RadarChart>
+                </ResponsiveContainer>
+              </Box>
+            </Paper>
+
+            <Paper sx={{ flex: 1, p: 1.5, borderRadius: 0, height: 280, display: 'flex', flexDirection: 'column' }}>
+              <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 1 }}>
+                <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161' }}>
+                  SEVERITY TRANSITION HISTORY — {selectedModule.toUpperCase()} &nbsp;
+                  <span style={{ color: '#9e9e9e', fontWeight: 'normal' }}>(SILVER)</span>
+                </Typography>
+                <Box sx={{ display: 'flex', gap: 1 }}>
+                  {[{ label: 'NORMAL', color: '#2e7d32' }, { label: 'WARNING', color: '#ed6c02' }, { label: 'CRITICAL', color: '#d32f2f' }].map((s) => (
+                    <Box key={s.label} sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                      <Box sx={{ width: 10, height: 10, bgcolor: s.color, borderRadius: '2px' }} />
+                      <Typography variant="caption" sx={{ fontSize: '10px', color: '#616161', fontFamily: 'monospace' }}>{s.label}</Typography>
+                    </Box>
+                  ))}
+                </Box>
+              </Box>
+              {severityRuns.length > 0 ? (
+                <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5, flex: 1 }}>
+                  <Box sx={{ display: 'flex', height: 44, width: '100%', overflow: 'hidden', borderRadius: '2px', border: '1px solid #e0e0e0' }}>
+                    {severityRuns.map((run, i) => (
+                      <Box
+                        key={i}
+                        title={`${run.severity}: ${run.startTs} → ${run.endTs} (${run.count} pts)`}
+                        sx={{
+                          flex: run.count,
+                          bgcolor: run.severity === 'CRITICAL' ? '#d32f2f' : run.severity === 'WARNING' ? '#ed6c02' : '#2e7d32',
+                          '&:hover': { opacity: 0.75, cursor: 'default' },
+                        }}
+                      />
+                    ))}
+                  </Box>
+                  <Box sx={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <Typography variant="caption" sx={{ fontSize: '10px', color: '#9e9e9e', fontFamily: 'monospace' }}>
+                      {severityRuns[0]?.startTs}
+                    </Typography>
+                    <Typography variant="caption" sx={{ fontSize: '10px', color: '#9e9e9e', fontFamily: 'monospace' }}>
+                      {severityRuns[severityRuns.length - 1]?.endTs}
+                    </Typography>
+                  </Box>
+                  <Box sx={{ display: 'flex', gap: 3, mt: 0.5 }}>
+                    {severityDistribution.map((d) => (
+                      <Box key={d.name} sx={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start' }}>
+                        <Typography variant="h6" sx={{ fontWeight: 'bold', color: d.color, fontFamily: 'monospace', lineHeight: 1.1 }}>
+                          {d.pct}%
+                        </Typography>
+                        <Typography variant="caption" sx={{ fontSize: '10px', color: '#757575', fontFamily: 'monospace' }}>{d.name}</Typography>
+                        <Typography variant="caption" sx={{ fontSize: '9px', color: '#9e9e9e', fontFamily: 'monospace' }}>{d.value} pts</Typography>
+                      </Box>
+                    ))}
+                  </Box>
+                </Box>
+              ) : (
+                <Box sx={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <Typography variant="caption" sx={{ color: '#9e9e9e' }}>No silver data for this module</Typography>
+                </Box>
+              )}
+            </Paper>
+          </Box>
+
+          {/* ── ROW C: Anomaly driver trends + Severity distribution donut ── */}
+          <Box sx={{ display: 'flex', gap: 2 }}>
+            <Paper sx={{ flex: 2, p: 1.5, borderRadius: 0, height: 280, display: 'flex', flexDirection: 'column' }}>
+              <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161', mb: 0.5 }}>
+                ANOMALY DRIVER TRENDS — SHAP FEATURE IMPORTANCE OVER TIME &nbsp;
+                <span style={{ color: '#9e9e9e', fontWeight: 'normal' }}>({selectedModule.toUpperCase()} SILVER)</span>
+              </Typography>
+              <Box sx={{ flex: 1, minHeight: 0 }}>
+                {anomalyTrendData.length > 0 && anomalyTrendSeries.length > 0 ? (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={anomalyTrendData} margin={{ top: 4, right: 15, left: -25, bottom: 0 }}>
+                      <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#eeeeee" />
+                      <XAxis dataKey={xAxisMode === 'mileage' ? 'mileage' : 'ts'} tick={axisStyle} axisLine={{ stroke: '#bdbdbd' }} tickLine={false} minTickGap={50} tickFormatter={(v) => formatXTick(v, xAxisMode)} />
+                      <YAxis domain={[0, 1]} tick={axisStyle} axisLine={{ stroke: '#bdbdbd' }} tickLine={false} tickFormatter={(v: number) => v.toFixed(1)} />
+                      <Tooltip contentStyle={{ borderRadius: 0, fontSize: '10px', padding: '4px 8px' }} formatter={(v: any, name: any) => [Number(v).toFixed(3), String(name).replace(/_/g, ' ')]} />
+                      <Legend wrapperStyle={{ fontSize: '9px', fontWeight: 'bold' }} formatter={(value: any) => String(value).replace(/_/g, ' ').slice(0, 22)} />
+                      {anomalyTrendSeries.map((feature, i) => (
+                        <Line key={feature} type="monotone" dataKey={feature} name={feature} stroke={SHAP_COLORS[i] || '#9e9e9e'} strokeWidth={1.5} dot={false} isAnimationActive={false} />
+                      ))}
+                    </LineChart>
+                  </ResponsiveContainer>
+                ) : (
+                  <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%' }}>
+                    <Typography variant="caption" sx={{ color: '#9e9e9e' }}>No SHAP data in silver history</Typography>
+                  </Box>
+                )}
+              </Box>
+            </Paper>
+
+            <Paper sx={{ flex: 1, p: 1.5, borderRadius: 0, height: 280, display: 'flex', flexDirection: 'column' }}>
+              <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161', mb: 0.5 }}>
+                SEVERITY DISTRIBUTION — {selectedModule.toUpperCase()}
+              </Typography>
+              <Box sx={{ flex: 1, minHeight: 0 }}>
+                {moduleHealthData.length > 0 ? (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <PieChart>
+                      <Pie
+                        data={severityDistribution}
+                        dataKey="value"
+                        nameKey="name"
+                        cx="50%"
+                        cy="45%"
+                        innerRadius={52}
+                        outerRadius={78}
+                        isAnimationActive={false}
+                      >
+                        {severityDistribution.map((entry, i) => (
+                          <Cell key={i} fill={entry.color} />
+                        ))}
+                      </Pie>
+                      <Tooltip
+                        contentStyle={{ borderRadius: 0, fontSize: '11px' }}
+                        formatter={(v: any, name: any) => {
+                          const d = severityDistribution.find((x) => x.name === name);
+                          return [`${v} pts (${d?.pct ?? 0}%)`, name];
+                        }}
+                      />
+                      <Legend wrapperStyle={{ fontSize: '10px', fontWeight: 'bold' }} />
+                    </PieChart>
+                  </ResponsiveContainer>
+                ) : (
+                  <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%' }}>
+                    <Typography variant="caption" sx={{ color: '#9e9e9e' }}>No severity data</Typography>
+                  </Box>
+                )}
+              </Box>
+            </Paper>
+          </Box>
+
+          {/* ── ROW D: Bronze sensor statistics table ── */}
+          <Paper sx={{ p: 1.5, borderRadius: 0 }}>
+            <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161', mb: 1, display: 'block' }}>
+              BRONZE SENSOR STATISTICS — {selectedModule.toUpperCase()} &nbsp;
+              <span style={{ color: '#9e9e9e', fontWeight: 'normal' }}>({sensorData.length.toLocaleString()} data points)</span>
+            </Typography>
+            {sensorStats.length > 0 ? (
+              <Box sx={{ overflowX: 'auto' }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontFamily: 'monospace', fontSize: '11px' }}>
+                  <thead>
+                    <tr style={{ borderBottom: '2px solid #bdbdbd' }}>
+                      {['SENSOR', 'UNIT', 'MIN', 'MAX', 'MEAN', 'STD DEV', 'LATEST'].map((h) => (
+                        <th key={h} style={{ textAlign: 'left', padding: '4px 12px', color: '#616161', fontWeight: 700, whiteSpace: 'nowrap' }}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {sensorStats.map((s: any, i: number) => {
+                      const isWarn = s.latest !== null && !isNaN(s.latest) && s.warnFn ? s.warnFn(s.latest) : false;
+                      return (
+                        <tr key={s.key} style={{ borderBottom: '1px solid #f0f0f0', background: i % 2 === 0 ? '#fafafa' : 'white' }}>
+                          <td style={{ padding: '5px 12px', fontWeight: 600 }}>{s.label}</td>
+                          <td style={{ padding: '5px 12px', color: '#9e9e9e' }}>{s.unit || '—'}</td>
+                          <td style={{ padding: '5px 12px' }}>{s.min !== null ? s.min.toFixed(2) : '—'}</td>
+                          <td style={{ padding: '5px 12px' }}>{s.max !== null ? s.max.toFixed(2) : '—'}</td>
+                          <td style={{ padding: '5px 12px' }}>{s.mean !== null ? s.mean.toFixed(2) : '—'}</td>
+                          <td style={{ padding: '5px 12px' }}>{s.std !== null ? s.std.toFixed(2) : '—'}</td>
+                          <td style={{ padding: '5px 12px', fontWeight: 'bold', color: isWarn ? '#d32f2f' : '#212121' }}>
+                            {s.latest !== null && !isNaN(s.latest) ? s.latest.toFixed(2) : '—'}
+                            {isWarn && <span style={{ marginLeft: 4, fontSize: '9px', color: '#d32f2f' }}>▲</span>}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </Box>
+            ) : (
+              <Typography variant="caption" sx={{ color: '#9e9e9e' }}>
+                Select a vehicle and module to load sensor statistics
+              </Typography>
+            )}
+          </Paper>
+
+          {/* ── SECTION DIVIDER ── */}
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, my: 0.5 }}>
+            <Box sx={{ flex: 1, height: '1px', bgcolor: '#e0e0e0' }} />
+            <Typography variant="caption" sx={{ color: '#9e9e9e', fontWeight: 'bold', fontFamily: 'monospace', letterSpacing: 1, whiteSpace: 'nowrap' }}>
+              FAULT & ALERT HISTORY
+            </Typography>
+            <Box sx={{ flex: 1, height: '1px', bgcolor: '#e0e0e0' }} />
+          </Box>
+
+          {/* ── ROW E: Vehicle alerts table ── */}
+          <Paper sx={{ p: 1.5, borderRadius: 0 }}>
+            <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 1 }}>
+              <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161' }}>
+                VEHICLE ALERTS — {selectedVehicle} &nbsp;
+                <span style={{ color: '#9e9e9e', fontWeight: 'normal' }}>(GOLD ALERTS DELTA)</span>
+              </Typography>
+              <Box sx={{ display: 'flex', gap: 1 }}>
+                {vehicleAlertsQuery.data?.open?.length > 0 && (
+                  <Chip size="small" label={`${vehicleAlertsQuery.data.open.length} OPEN`}
+                    sx={{ borderRadius: 0, fontWeight: 'bold', fontSize: '10px', height: 18, bgcolor: '#d32f2f', color: 'white' }} />
+                )}
+                {vehicleAlertsQuery.data?.closed?.length > 0 && (
+                  <Chip size="small" label={`${vehicleAlertsQuery.data.closed.length} CLOSED`}
+                    sx={{ borderRadius: 0, fontWeight: 'bold', fontSize: '10px', height: 18, bgcolor: '#e0e0e0', color: '#424242' }} />
+                )}
+              </Box>
+            </Box>
+            {vehicleAlertsQuery.isLoading ? (
+              <Typography variant="caption" sx={{ color: '#9e9e9e' }}>Loading…</Typography>
+            ) : (
+              <Box sx={{ overflowX: 'auto' }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontFamily: 'monospace', fontSize: '11px' }}>
+                  <thead>
+                    <tr style={{ borderBottom: '2px solid #bdbdbd' }}>
+                      {['STATUS', 'MODULE', 'STARTED', 'PEAK TS', 'ENDED', 'MAX SCORE', 'TOP FEATURES'].map((h) => (
+                        <th key={h} style={{ textAlign: 'left', padding: '4px 12px', color: '#616161', fontWeight: 700, whiteSpace: 'nowrap' }}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {[...(vehicleAlertsQuery.data?.open || []), ...(vehicleAlertsQuery.data?.closed || [])].map((a: any, i: number) => (
+                      <tr key={a.alert_id || i} style={{ borderBottom: '1px solid #f0f0f0', background: i % 2 === 0 ? '#fafafa' : 'white' }}>
+                        <td style={{ padding: '5px 12px' }}>
+                          <span style={{
+                            display: 'inline-block', padding: '1px 6px', fontSize: '10px', fontWeight: 700,
+                            background: a.status === 'OPEN' ? '#d32f2f' : '#e0e0e0',
+                            color: a.status === 'OPEN' ? 'white' : '#424242',
+                          }}>{a.status}</span>
+                        </td>
+                        <td style={{ padding: '5px 12px', fontWeight: 600 }}>{(a.module || '—').toUpperCase()}</td>
+                        <td style={{ padding: '5px 12px', color: '#616161' }}>{String(a.alert_start_ts || '—').slice(0, 16)}</td>
+                        <td style={{ padding: '5px 12px', color: '#616161' }}>{String(a.peak_anomaly_ts || '—').slice(0, 16)}</td>
+                        <td style={{ padding: '5px 12px', color: '#616161' }}>{a.status === 'CLOSED' ? String(a.alert_end_ts || '—').slice(0, 16) : '—'}</td>
+                        <td style={{ padding: '5px 12px', fontWeight: 'bold', color: Number(a.max_composite_score) > 80 ? '#d32f2f' : '#212121' }}>
+                          {a.max_composite_score != null ? Number(a.max_composite_score).toFixed(1) : '—'}
+                        </td>
+                        <td style={{ padding: '5px 12px', color: '#757575', maxWidth: 260, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                          {a.top_10_features || '—'}
+                        </td>
+                      </tr>
+                    ))}
+                    {(!vehicleAlertsQuery.data?.open?.length && !vehicleAlertsQuery.data?.closed?.length) && (
+                      <tr><td colSpan={7} style={{ padding: '10px 12px', color: '#9e9e9e', textAlign: 'center' }}>No alerts recorded for this vehicle</td></tr>
+                    )}
+                  </tbody>
+                </table>
+              </Box>
+            )}
+          </Paper>
+
+          {/* ── ROW F: DTC run history ── */}
+          <Paper sx={{ p: 1.5, borderRadius: 0 }}>
+            <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161', mb: 1, display: 'block' }}>
+              DTC ANALYSIS RUN HISTORY — {selectedVehicle} &nbsp;
+              <span style={{ color: '#9e9e9e', fontWeight: 'normal' }}>(last 50 runs)</span>
+            </Typography>
+            {dtcHistoryQuery.isLoading ? (
+              <Typography variant="caption" sx={{ color: '#9e9e9e' }}>Loading…</Typography>
+            ) : (
+              <Box sx={{ overflowX: 'auto' }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontFamily: 'monospace', fontSize: '11px' }}>
+                  <thead>
+                    <tr style={{ borderBottom: '2px solid #bdbdbd' }}>
+                      {['RUN TIME', 'MODULE', 'PEAK TS', 'TRIGGERED CODES'].map((h) => (
+                        <th key={h} style={{ textAlign: 'left', padding: '4px 12px', color: '#616161', fontWeight: 700, whiteSpace: 'nowrap' }}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(dtcHistoryQuery.data?.runs || []).map((run: any, i: number) => (
+                      <tr key={i} style={{ borderBottom: '1px solid #f0f0f0', background: i % 2 === 0 ? '#fafafa' : 'white' }}>
+                        <td style={{ padding: '5px 12px', color: '#616161' }}>{String(run.run_ts || '—').slice(0, 16)}</td>
+                        <td style={{ padding: '5px 12px', fontWeight: 600 }}>{(run.module || '—').toUpperCase()}</td>
+                        <td style={{ padding: '5px 12px', color: '#616161' }}>{String(run.peak_ts || '—').slice(0, 16)}</td>
+                        <td style={{ padding: '5px 12px' }}>
+                          {(run.triggers || []).length === 0 ? (
+                            <span style={{ color: '#2e7d32', fontWeight: 600 }}>NO FAULTS</span>
+                          ) : (
+                            (run.triggers as any[]).map((t: any, j: number) => (
+                              <span key={j} style={{
+                                display: 'inline-block', marginRight: 6, padding: '1px 6px', fontSize: '10px', fontWeight: 700,
+                                background: t.severity === 'CRITICAL' ? '#d32f2f' : '#ed6c02', color: 'white',
+                              }}>{t.code}</span>
+                            ))
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                    {!(dtcHistoryQuery.data?.runs?.length) && (
+                      <tr><td colSpan={4} style={{ padding: '10px 12px', color: '#9e9e9e', textAlign: 'center' }}>No DTC analysis runs recorded for this vehicle</td></tr>
+                    )}
+                  </tbody>
+                </table>
+              </Box>
+            )}
+          </Paper>
+
+          {/* ── SECTION DIVIDER ── */}
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, my: 0.5 }}>
+            <Box sx={{ flex: 1, height: '1px', bgcolor: '#e0e0e0' }} />
+            <Typography variant="caption" sx={{ color: '#9e9e9e', fontWeight: 'bold', fontFamily: 'monospace', letterSpacing: 1, whiteSpace: 'nowrap' }}>
+              DTC DEEP DIVE
+            </Typography>
+            <Box sx={{ flex: 1, height: '1px', bgcolor: '#e0e0e0' }} />
+          </Box>
+
+          {/* ── ROW G: On-demand DTC analysis ── */}
+          <Paper sx={{ p: 1.5, borderRadius: 0 }}>
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, mb: 1.5, flexWrap: 'wrap' }}>
+              <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161' }}>
+                DTC DEEP DIVE — {selectedVehicle} / {selectedModule.toUpperCase()}
+              </Typography>
+              <button
+                onClick={runDtcAnalysis}
+                disabled={dtcRunning || !selectedVehicle}
+                style={{
+                  padding: '4px 14px', fontFamily: 'monospace', fontSize: '11px', fontWeight: 700,
+                  background: dtcRunning ? '#e0e0e0' : '#1976d2', color: dtcRunning ? '#9e9e9e' : 'white',
+                  border: 'none', borderRadius: 0, cursor: dtcRunning ? 'not-allowed' : 'pointer',
+                  letterSpacing: '0.5px',
+                }}
+              >
+                {dtcRunning ? 'RUNNING INFERENCE…' : 'RUN DTC ANALYSIS'}
+              </button>
+              <Typography variant="caption" sx={{ color: '#9e9e9e', fontFamily: 'monospace', fontSize: '10px' }}>
+                Runs PyTorch fault models on 600-row bronze traceback at peak anomaly timestamp
+              </Typography>
+            </Box>
+
+            {dtcResult?.error && (
+              <Box sx={{ p: 1.5, bgcolor: '#fff8e1', border: '1px solid #ffe082' }}>
+                <Typography variant="caption" sx={{ color: '#e65100', fontFamily: 'monospace' }}>{dtcResult.error}</Typography>
+              </Box>
+            )}
+
+            {dtcResult?.success && (
+              <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap', alignItems: 'center' }}>
+                  <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161', mr: 0.5 }}>TRIGGERED CODES:</Typography>
+                  {dtcResult.triggers?.length === 0 ? (
+                    <Chip size="small" label="NO FAULTS TRIGGERED" sx={{ borderRadius: 0, fontWeight: 'bold', bgcolor: '#e8f5e9', color: '#2e7d32', fontSize: '11px' }} />
+                  ) : (
+                    (dtcResult.triggers as any[]).map((t: any, i: number) => (
+                      <Box key={i} sx={{ display: 'flex', flexDirection: 'column', p: 1, border: `1px solid ${t.severity === 'CRITICAL' ? '#d32f2f' : '#ed6c02'}`, minWidth: 200, maxWidth: 320 }}>
+                        <Box sx={{ display: 'flex', gap: 1, alignItems: 'center', mb: 0.5 }}>
+                          <span style={{
+                            padding: '1px 6px', fontSize: '10px', fontWeight: 700,
+                            background: t.severity === 'CRITICAL' ? '#d32f2f' : '#ed6c02', color: 'white',
+                          }}>{t.severity}</span>
+                          <Typography variant="caption" sx={{ fontWeight: 'bold', fontFamily: 'monospace' }}>{t.code}</Typography>
+                        </Box>
+                        <Typography variant="caption" sx={{ fontSize: '10px', color: '#616161', lineHeight: 1.4 }}>{t.message}</Typography>
+                      </Box>
+                    ))
+                  )}
+                </Box>
+
+                {(dtcResult.critical_plot || dtcResult.non_critical_plot) && (
+                  <Box sx={{ display: 'flex', gap: 2 }}>
+                    {[
+                      { plot: dtcResult.critical_plot, label: 'CRITICAL FAULT MATURATION' },
+                      { plot: dtcResult.non_critical_plot, label: 'NON-CRITICAL FAULT MATURATION' },
+                    ].filter((p) => p.plot).map(({ plot, label }) => {
+                      const traces: any[] = plot.data || [];
+                      const allX: string[] = traces[0]?.x || [];
+                      const factor = Math.max(1, Math.floor(allX.length / 200));
+                      const chartData = allX
+                        .filter((_: any, i: number) => i % factor === 0)
+                        .map((_: any, i: number) => {
+                          const idx = i * factor;
+                          const row: Record<string, any> = { ts: String(allX[idx] || '').slice(5, 16) };
+                          traces.forEach((t: any) => { row[t.name] = t.y?.[idx] ?? 0; });
+                          return row;
+                        });
+                      const seriesNames: string[] = traces.map((t: any) => t.name);
+                      return (
+                        <Paper key={label} sx={{ flex: 1, p: 1.5, borderRadius: 0, height: 240, display: 'flex', flexDirection: 'column', border: '1px solid #e0e0e0' }}>
+                          <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161', mb: 0.5 }}>{label}</Typography>
+                          <Box sx={{ flex: 1, minHeight: 0 }}>
+                            <ResponsiveContainer width="100%" height="100%">
+                              <LineChart data={chartData} margin={{ top: 4, right: 15, left: -25, bottom: 0 }}>
+                                <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#eeeeee" />
+                                <XAxis dataKey="ts" tick={axisStyle} axisLine={{ stroke: '#bdbdbd' }} tickLine={false} minTickGap={40} />
+                                <YAxis domain={[0, 1.1]} tick={axisStyle} axisLine={{ stroke: '#bdbdbd' }} tickLine={false} tickFormatter={(v: number) => v.toFixed(1)} />
+                                <ReferenceLine y={1.0} stroke="#d32f2f" strokeDasharray="4 4" label={{ value: 'TRIGGER', fontSize: 9, fill: '#d32f2f' }} />
+                                <Tooltip contentStyle={{ borderRadius: 0, fontSize: '10px' }} formatter={(v: any, name: any) => [Number(v).toFixed(3), String(name).slice(0, 20)]} />
+                                <Legend wrapperStyle={{ fontSize: '9px', fontWeight: 'bold' }} formatter={(v: any) => String(v).slice(0, 18)} />
+                                {seriesNames.map((name, i) => (
+                                  <Line key={name} type="monotone" dataKey={name} stroke={SHAP_COLORS[i % SHAP_COLORS.length]} strokeWidth={1.5} dot={false} isAnimationActive={false} />
+                                ))}
+                              </LineChart>
+                            </ResponsiveContainer>
+                          </Box>
+                        </Paper>
+                      );
+                    })}
+                  </Box>
+                )}
+
+                {dtcResult.diagnostics?.skipped_dtcs && Object.keys(dtcResult.diagnostics.skipped_dtcs).length > 0 && (
+                  <Box sx={{ p: 1, bgcolor: '#fafafa', border: '1px solid #e0e0e0' }}>
+                    <Typography variant="caption" sx={{ color: '#9e9e9e', fontFamily: 'monospace', fontSize: '10px' }}>
+                      SKIPPED: {Object.keys(dtcResult.diagnostics.skipped_dtcs).join(', ')} — missing bronze features
+                    </Typography>
+                  </Box>
+                )}
+              </Box>
+            )}
+
+            {!dtcResult && !dtcRunning && (
+              <Typography variant="caption" sx={{ color: '#9e9e9e', fontFamily: 'monospace' }}>
+                Click RUN DTC ANALYSIS to run fault inference. Requires dtc_service/api.py running on port 8007.
+              </Typography>
+            )}
+          </Paper>
         </Box>
       )}
 

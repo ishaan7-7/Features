@@ -571,3 +571,57 @@ def get_automotive_module_crossfleet(module: str):
             vehicle_stats.append(stat)
 
     return {"module": module, "vehicles": vehicle_stats, "sensor_keys": sensor_keys}
+
+
+_GOLD_ALERTS_DIR = os.path.join(_PROJECT_ROOT, "data", "delta", "gold", "alerts")
+_DTC_HISTORY_FILE = os.path.join(_PROJECT_ROOT, "data", "dtc_history.json")
+
+
+@router.get("/api/automotive/alerts/{vehicle_id}")
+def get_vehicle_alerts(vehicle_id: str):
+    import pandas as pd
+    if not os.path.exists(_GOLD_ALERTS_DIR):
+        return {"vehicle_id": vehicle_id, "open": [], "closed": []}
+    files = [
+        os.path.join(r, f)
+        for r, _, ff in os.walk(_GOLD_ALERTS_DIR)
+        for f in ff if f.endswith(".parquet")
+    ]
+    dfs = []
+    for fp in files:
+        try:
+            df = pd.read_parquet(fp)
+            if not df.empty:
+                dfs.append(df)
+        except Exception:
+            pass
+    if not dfs:
+        return {"vehicle_id": vehicle_id, "open": [], "closed": []}
+    combined = pd.concat(dfs, ignore_index=True)
+    vehicle_df = combined[combined["source_id"] == vehicle_id].copy()
+    if vehicle_df.empty:
+        return {"vehicle_id": vehicle_id, "open": [], "closed": []}
+    for col in vehicle_df.select_dtypes(include=["datetime64[ns]", "datetime64[ns, UTC]"]).columns:
+        vehicle_df[col] = vehicle_df[col].astype(str)
+    vehicle_df = vehicle_df.fillna("")
+    open_df = vehicle_df[vehicle_df["status"] == "OPEN"].sort_values("peak_anomaly_ts", ascending=False)
+    closed_df = vehicle_df[vehicle_df["status"] == "CLOSED"].sort_values("alert_end_ts", ascending=False)
+    return {
+        "vehicle_id": vehicle_id,
+        "open": open_df.head(50).to_dict(orient="records"),
+        "closed": closed_df.head(50).to_dict(orient="records"),
+    }
+
+
+@router.get("/api/automotive/dtc-history/{vehicle_id}")
+def get_vehicle_dtc_history(vehicle_id: str):
+    if not os.path.exists(_DTC_HISTORY_FILE):
+        return {"vehicle_id": vehicle_id, "runs": []}
+    try:
+        with open(_DTC_HISTORY_FILE, "r") as f:
+            all_runs: list = json.load(f)
+    except Exception:
+        return {"vehicle_id": vehicle_id, "runs": []}
+    vehicle_runs = [r for r in all_runs if r.get("source_id") == vehicle_id]
+    vehicle_runs.sort(key=lambda r: r.get("run_ts", ""), reverse=True)
+    return {"vehicle_id": vehicle_id, "runs": vehicle_runs[:50]}
