@@ -221,13 +221,28 @@ def _attach_mileage(combined, vehicle_id: str):
             if not bdf.empty and "odometer_reading" in bdf.columns:
                 btc = next((c for c in ("timestamp", "ingest_ts") if c in bdf.columns), None)
                 if btc:
-                    bdf["timestamp"] = pd.to_datetime(bdf[btc]).dt.strftime("%Y-%m-%d %H:%M")
-                    bdfs.append(bdf[["timestamp", "odometer_reading"]])
+                    raw_ts = pd.to_datetime(bdf[btc], errors="coerce", utc=True)
+                    bdf["_body_ts"] = raw_ts.dt.tz_convert(None)
+                    bdfs.append(bdf[["_body_ts", "odometer_reading"]].dropna(subset=["_body_ts"]))
         except Exception:
             pass
     if bdfs:
-        body_merged = pd.concat(bdfs, ignore_index=True).drop_duplicates("timestamp")
-        combined = combined.merge(body_merged, on="timestamp", how="left")
+        body_merged = (
+            pd.concat(bdfs, ignore_index=True)
+            .sort_values("_body_ts")
+            .drop_duplicates("_body_ts")
+        )
+        combined["_comb_ts"] = pd.to_datetime(combined["timestamp"], errors="coerce")
+        combined_sorted = combined.sort_values("_comb_ts").copy()
+        merged = pd.merge_asof(
+            combined_sorted,
+            body_merged.rename(columns={"_body_ts": "_comb_ts"}),
+            on="_comb_ts",
+            direction="nearest",
+            tolerance=pd.Timedelta("10min"),
+        )
+        merged = merged.drop(columns=["_comb_ts"])
+        combined = merged
         combined["mileage"] = combined["odometer_reading"].fillna(0)
     else:
         combined["mileage"] = range(len(combined))

@@ -166,14 +166,16 @@ function SensorChart({
   data,
   group,
   xAxisMode,
+  height = 210,
 }: {
   data: any[];
   group: { title: string; sensors: { key: string; color: string; label: string }[] };
   xAxisMode: XAxisMode;
+  height?: number | string;
 }) {
   const xKey = xAxisMode === 'timestamp' ? 'timestamp' : 'mileage';
   return (
-    <Paper sx={{ p: 1.5, borderRadius: 0, height: 210, display: 'flex', flexDirection: 'column' }}>
+    <Paper sx={{ p: 1.5, borderRadius: 0, height, display: 'flex', flexDirection: 'column' }}>
       <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161', letterSpacing: '0.5px', mb: 0.5 }}>
         {group.title}
       </Typography>
@@ -253,6 +255,15 @@ export default function AutomotiveDive() {
     refetchInterval: false,
   });
 
+  // Module tab sensor timeline — separate from vehicle tab's sensorQuery
+  const moduleTimelineQuery = useQuery({
+    queryKey: ['autoModuleTimeline', selectedVehicle, analysisModule],
+    queryFn: () =>
+      axios.get(`${API}/api/automotive/sensor-history/${selectedVehicle}/${analysisModule}`).then((r) => r.data),
+    enabled: !!selectedVehicle && activeTab === 'module',
+    refetchInterval: false,
+  });
+
   useEffect(() => {
     const vehicles = fleetQuery.data?.vehicles;
     if (vehicles?.length > 0 && !selectedVehicle) setSelectedVehicle(vehicles[0].vehicle_id);
@@ -325,6 +336,12 @@ export default function AutomotiveDive() {
       })),
     [crossfleetVehicles, currentAnalysisKey],
   );
+
+  const moduleTimelineData: any[] = useMemo(() => {
+    const raw: any[] = moduleTimelineQuery.data?.data || [];
+    const factor = Math.max(1, Math.floor(raw.length / 300));
+    return factor === 1 ? raw : raw.filter((_: any, i: number) => i % factor === 0);
+  }, [moduleTimelineQuery.data]);
 
   const fleetColDefs = useMemo<ColDef[]>(
     () => [
@@ -462,7 +479,7 @@ export default function AutomotiveDive() {
           {/* GOLD + SILVER health charts side by side */}
           <Box sx={{ display: 'flex', gap: 2 }}>
             {/* GOLD: Fused vehicle health */}
-            <Paper sx={{ flex: 1, p: 1.5, borderRadius: 0, height: 190, display: 'flex', flexDirection: 'column' }}>
+            <Paper sx={{ flex: 1, p: 1.5, borderRadius: 0, height: 260, display: 'flex', flexDirection: 'column' }}>
               <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 0.5 }}>
                 <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161' }}>
                   FUSED VEHICLE HEALTH — {selectedVehicle} &nbsp;
@@ -475,7 +492,7 @@ export default function AutomotiveDive() {
                 <ResponsiveContainer width="100%" height="100%">
                   <LineChart data={healthHistory} margin={{ top: 4, right: 15, left: -25, bottom: 0 }}>
                     <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#eeeeee" />
-                    <XAxis dataKey="ts" tick={axisStyle} axisLine={{ stroke: '#bdbdbd' }} tickLine={false} minTickGap={40} />
+                    <XAxis dataKey="ts" tick={axisStyle} axisLine={{ stroke: '#bdbdbd' }} tickLine={false} minTickGap={40} tickFormatter={(v) => formatXTick(v, 'timestamp')} />
                     <YAxis domain={[0, 100]} tick={axisStyle} axisLine={{ stroke: '#bdbdbd' }} tickLine={false} />
                     <Tooltip contentStyle={{ borderRadius: 0, fontSize: '11px' }} formatter={(v: number) => `${v.toFixed(1)}%`} />
                     <ReferenceLine y={60} stroke="#d32f2f" strokeDasharray="4 4" />
@@ -487,7 +504,7 @@ export default function AutomotiveDive() {
             </Paper>
 
             {/* SILVER: Per-module ML health */}
-            <Paper sx={{ flex: 1, p: 1.5, borderRadius: 0, height: 190, display: 'flex', flexDirection: 'column' }}>
+            <Paper sx={{ flex: 1, p: 1.5, borderRadius: 0, height: 260, display: 'flex', flexDirection: 'column' }}>
               <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 0.5 }}>
                 <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161' }}>
                   {selectedModule.toUpperCase()} ML HEALTH SCORE &nbsp;
@@ -517,7 +534,7 @@ export default function AutomotiveDive() {
             </Paper>
 
             {/* Top anomaly drivers (Silver top_features) */}
-            <Paper sx={{ width: 220, p: 1.5, borderRadius: 0, height: 190, display: 'flex', flexDirection: 'column' }}>
+            <Paper sx={{ width: 240, p: 1.5, borderRadius: 0, height: 260, display: 'flex', flexDirection: 'column' }}>
               <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161', mb: 1 }}>
                 TOP ANOMALY DRIVERS
               </Typography>
@@ -594,7 +611,7 @@ export default function AutomotiveDive() {
             )}
           </Paper>
 
-          <Box sx={{ display: 'flex', gap: 2, flex: 1, minHeight: 0 }}>
+          <Box sx={{ display: 'flex', gap: 2, height: 300, minHeight: 0 }}>
             <Paper sx={{ flex: 1, p: 2, borderRadius: 0, display: 'flex', flexDirection: 'column' }}>
               <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161', mb: 1 }}>
                 FLEET AVERAGE — {currentAnalysisKey.replace(/_/g, ' ').toUpperCase()} (BRONZE)
@@ -634,29 +651,39 @@ export default function AutomotiveDive() {
           </Box>
 
           {/* Inline timeline for selected vehicle+module */}
-          <Paper sx={{ p: 1.5, borderRadius: 0 }}>
+          <Paper sx={{ p: 1.5, borderRadius: 0, height: 260, display: 'flex', flexDirection: 'column' }}>
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, mb: 1 }}>
               <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161' }}>
-                SENSOR TIMELINE — select vehicle then switch to VEHICLE DEEP DIVE for full drill-down:
+                SENSOR TIMELINE — {analysisModule.toUpperCase()} — switch to VEHICLE DEEP DIVE for full drill-down
               </Typography>
               <FormControl size="small" sx={{ minWidth: 160 }}>
                 <Select value={selectedVehicle}
-                  onChange={(e) => { setSelectedVehicle(e.target.value); setSelectedModule(analysisModule); }}
+                  onChange={(e) => setSelectedVehicle(e.target.value)}
                   displayEmpty sx={{ borderRadius: 0 }}>
                   {vehicles.map((v: any) => <MenuItem key={v.vehicle_id} value={v.vehicle_id}>{v.vehicle_id}</MenuItem>)}
                 </Select>
               </FormControl>
+              {moduleTimelineData.length > 0 && (
+                <Typography variant="caption" sx={{ color: '#9e9e9e' }}>{moduleTimelineData.length} pts</Typography>
+              )}
             </Box>
-            {currentAnalysisKey && downsampledBronze.length > 0 && selectedModule === analysisModule && (
-              <Box sx={{ height: 170 }}>
+            <Box sx={{ flex: 1, minHeight: 0 }}>
+              {currentAnalysisKey && moduleTimelineData.length > 0 ? (
                 <SensorChart
-                  data={downsampledBronze}
+                  data={moduleTimelineData}
                   group={{ title: `${currentAnalysisKey.replace(/_/g, ' ').toUpperCase()} — ${selectedVehicle}`,
                     sensors: [{ key: currentAnalysisKey, color: MODULE_COLORS[analysisModule], label: currentAnalysisKey }] }}
                   xAxisMode={xAxisMode}
+                  height="100%"
                 />
-              </Box>
-            )}
+              ) : (
+                <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%' }}>
+                  <Typography variant="caption" sx={{ color: '#9e9e9e' }}>
+                    {!selectedVehicle ? 'Select a vehicle above' : moduleTimelineQuery.isLoading ? 'Loading…' : 'No sensor data for this vehicle/module'}
+                  </Typography>
+                </Box>
+              )}
+            </Box>
           </Paper>
         </Box>
       )}
