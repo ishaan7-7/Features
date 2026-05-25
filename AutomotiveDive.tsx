@@ -1,5 +1,6 @@
 import React, { useMemo, useState, useEffect } from 'react';
 import { useSearchParams } from 'react-router-dom';
+import Plot from 'react-plotly.js';
 import {
   Box, Typography, Paper, Select, MenuItem, FormControl, InputLabel,
   ToggleButton, ToggleButtonGroup, Chip,
@@ -1125,47 +1126,34 @@ export default function AutomotiveDive() {
                   )}
                 </Box>
 
-                {(dtcResult.critical_plot || dtcResult.non_critical_plot) && (
-                  <Box sx={{ display: 'flex', gap: 2 }}>
-                    {[
-                      { plot: dtcResult.critical_plot, label: 'CRITICAL FAULT MATURATION' },
-                      { plot: dtcResult.non_critical_plot, label: 'NON-CRITICAL FAULT MATURATION' },
-                    ].filter((p) => p.plot).map(({ plot, label }) => {
-                      const traces: any[] = plot.data || [];
-                      const allX: string[] = traces[0]?.x || [];
-                      const factor = Math.max(1, Math.floor(allX.length / 200));
-                      const chartData = allX
-                        .filter((_: any, i: number) => i % factor === 0)
-                        .map((_: any, i: number) => {
-                          const idx = i * factor;
-                          const row: Record<string, any> = { ts: String(allX[idx] || '').slice(5, 16) };
-                          traces.forEach((t: any) => { row[t.name] = t.y?.[idx] ?? 0; });
-                          return row;
-                        });
-                      const seriesNames: string[] = traces.map((t: any) => t.name);
-                      return (
-                        <Paper key={label} sx={{ flex: 1, p: 1.5, borderRadius: 0, height: 240, display: 'flex', flexDirection: 'column', border: '1px solid #e0e0e0' }}>
-                          <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161', mb: 0.5 }}>{label}</Typography>
-                          <Box sx={{ flex: 1, minHeight: 0 }}>
-                            <ResponsiveContainer width="100%" height="100%">
-                              <LineChart data={chartData} margin={{ top: 4, right: 15, left: -25, bottom: 0 }}>
-                                <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#eeeeee" />
-                                <XAxis dataKey="ts" tick={axisStyle} axisLine={{ stroke: '#bdbdbd' }} tickLine={false} minTickGap={40} />
-                                <YAxis domain={[0, 1.1]} tick={axisStyle} axisLine={{ stroke: '#bdbdbd' }} tickLine={false} tickFormatter={(v: number) => v.toFixed(1)} />
-                                <ReferenceLine y={1.0} stroke="#d32f2f" strokeDasharray="4 4" label={{ value: 'TRIGGER', fontSize: 9, fill: '#d32f2f' }} />
-                                <Tooltip contentStyle={{ borderRadius: 0, fontSize: '10px' }} formatter={(v: any, name: any) => [Number(v).toFixed(3), String(name).slice(0, 20)]} />
-                                <Legend wrapperStyle={{ fontSize: '9px', fontWeight: 'bold' }} formatter={(v: any) => String(v).slice(0, 18)} />
-                                {seriesNames.map((name, i) => (
-                                  <Line key={name} type="monotone" dataKey={name} stroke={SHAP_COLORS[i % SHAP_COLORS.length]} strokeWidth={1.5} dot={false} isAnimationActive={false} />
-                                ))}
-                              </LineChart>
-                            </ResponsiveContainer>
-                          </Box>
-                        </Paper>
-                      );
-                    })}
-                  </Box>
-                )}
+                <Box sx={{ display: 'flex', gap: 2, height: 380 }}>
+                  <Paper sx={{ flex: 1, borderRadius: 0, border: '1px solid #e0e0e0', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                    {dtcResult.critical_plot ? (
+                      <Plot
+                        data={dtcResult.critical_plot.data}
+                        layout={{ ...dtcResult.critical_plot.layout, autosize: true }}
+                        useResizeHandler={true}
+                        style={{ width: '100%', height: '100%' }}
+                        config={{ displayModeBar: false }}
+                      />
+                    ) : (
+                      <Typography variant="caption" sx={{ color: '#9e9e9e' }}>No critical DTCs monitored for this module</Typography>
+                    )}
+                  </Paper>
+                  <Paper sx={{ flex: 1, borderRadius: 0, border: '1px solid #e0e0e0', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                    {dtcResult.non_critical_plot ? (
+                      <Plot
+                        data={dtcResult.non_critical_plot.data}
+                        layout={{ ...dtcResult.non_critical_plot.layout, autosize: true }}
+                        useResizeHandler={true}
+                        style={{ width: '100%', height: '100%' }}
+                        config={{ displayModeBar: false }}
+                      />
+                    ) : (
+                      <Typography variant="caption" sx={{ color: '#9e9e9e' }}>No non-critical DTCs monitored for this module</Typography>
+                    )}
+                  </Paper>
+                </Box>
 
                 {dtcResult.diagnostics?.skipped_dtcs && Object.keys(dtcResult.diagnostics.skipped_dtcs).length > 0 && (
                   <Box sx={{ p: 1, bgcolor: '#fafafa', border: '1px solid #e0e0e0' }}>
