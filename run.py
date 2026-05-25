@@ -58,7 +58,8 @@ SERVICE_MAP = {
     "api_gold": ([VENV_PYTHON, r"gold_service\api.py"], False, ROOT_DIR),
     "api_inference": ([VENV_PYTHON, r"inference_service\api.py"], False, ROOT_DIR),
     "api_writer": ([VENV_PYTHON, r"writer_service\api.py"], False, ROOT_DIR),
-    "api_dtc": ([VENV_PYTHON, r"dtc_service\api.py"], False, ROOT_DIR),
+    "api_dtc":       ([VENV_PYTHON, r"dtc_service\api.py"],       False, ROOT_DIR),
+    "api_analytics": ([VENV_PYTHON, r"analytics_service\api.py"], False, ROOT_DIR),
     
     # Core Processing Engines
     "engine_alerts": ([VENV_PYTHON, r"alerts_service\app.py"], False, ROOT_DIR),
@@ -136,20 +137,39 @@ def launch_master_frontend():
     print("--- Starting Master Dashboard Frontend (React/Vite) ---")
     log_file = open(f"logs/Master_Dash_Frontend.log", "a", encoding="utf-8")
     open_log_files.append(log_file)
-    
+
     env = os.environ.copy()
     env["PATH"] = NODE_DIR + os.pathsep + env.get("PATH", "")
     env["npm_config_cache"] = NPM_CACHE
-    
+
     frontend_dir = os.path.join(ROOT_DIR, "master_dashboard", "frontend")
-    
-    cmd = "npm run dev -- --port 5173 --strictPort"
-    proc = subprocess.Popen(cmd, shell=True, cwd=frontend_dir, stdout=log_file, stderr=subprocess.STDOUT, env=env)
+    npm_cmd     = os.path.join(NODE_DIR, "npm.cmd")
+    node_modules = os.path.join(frontend_dir, "node_modules")
+
+    if not os.path.exists(node_modules):
+        print("   node_modules not found — running npm install (this takes ~1 min on first run)...")
+        result = subprocess.run(
+            f'"{npm_cmd}" install',
+            shell=True, cwd=frontend_dir,
+            stdout=log_file, stderr=subprocess.STDOUT,
+            env=env,
+        )
+        if result.returncode != 0:
+            print("   ERROR: npm install failed — check logs/Master_Dash_Frontend.log")
+            return
+        print("   npm install complete.")
+
+    proc = subprocess.Popen(
+        f'"{npm_cmd}" run dev -- --port 5173 --strictPort',
+        shell=True, cwd=frontend_dir,
+        stdout=log_file, stderr=subprocess.STDOUT,
+        env=env,
+    )
     running_processes.append({"proc": proc, "name": "Master_Dash_Frontend", "detached": False})
-    
-    print("   ⏳ Waiting for Vite to compile (6s)...")
+
+    print("   Waiting for Vite to compile (6s)...")
     time.sleep(6)
-    print("   🌐 Opening browser at http://localhost:5173")
+    print("   Opening browser at http://localhost:5173")
     webbrowser.open("http://localhost:5173")
 
 # --- Process Management ---
@@ -334,8 +354,8 @@ def main():
             
         print("\n--- Hard Resetting Infrastructure ---")
         
-        print("Clearing in-memory API Caches (Ports 8000-8007)...")
-        for port in range(8000, 8008):
+        print("Clearing in-memory API Caches (Ports 8000-8008)...")
+        for port in range(8000, 8009):
             hunt_and_kill_port(port, f"API Port {port}")
         time.sleep(2)
         
