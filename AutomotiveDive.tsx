@@ -839,8 +839,8 @@ export default function AutomotiveDive() {
           <Paper sx={{ p: 1.5, borderRadius: 0 }}>
             <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 1 }}>
               <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161' }}>
-                ANOMALY DRIVER TRENDS — TOP SHAP FEATURES &nbsp;
-                <span style={{ color: '#9e9e9e', fontWeight: 'normal' }}>({selectedModule.toUpperCase()} SILVER · one chart per feature)</span>
+                ANOMALY DRIVER TRENDS — LSTM RECONSTRUCTION ERROR PER FEATURE &nbsp;
+                <span style={{ color: '#9e9e9e', fontWeight: 'normal' }}>({selectedModule.toUpperCase()} SILVER · higher = more anomalous · standardized units)</span>
               </Typography>
               {anomalyTrendSeries.length > 0 && (
                 <Typography variant="caption" sx={{ color: '#9e9e9e', fontFamily: 'monospace', fontSize: '10px' }}>
@@ -856,7 +856,7 @@ export default function AutomotiveDive() {
                     data={anomalyTrendData}
                     group={{
                       title: feature.replace(/_/g, ' ').toUpperCase(),
-                      sensors: [{ key: feature, color: SHAP_COLORS[i % SHAP_COLORS.length], label: 'SHAP score' }],
+                      sensors: [{ key: feature, color: SHAP_COLORS[i % SHAP_COLORS.length], label: 'recon. error²' }],
                     }}
                     xAxisMode={xAxisMode}
                     height={170}
