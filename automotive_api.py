@@ -625,3 +625,454 @@ def get_vehicle_dtc_history(vehicle_id: str):
     vehicle_runs = [r for r in all_runs if r.get("source_id") == vehicle_id]
     vehicle_runs.sort(key=lambda r: r.get("run_ts", ""), reverse=True)
     return {"vehicle_id": vehicle_id, "runs": vehicle_runs[:50]}
+
+
+_DTC_MASTER_FILE = os.path.join(_PROJECT_ROOT, "contracts", "DTC_master.json")
+
+
+@router.get("/api/automotive/module-fleet-ranking/{module}")
+def get_module_fleet_ranking(module: str):
+    import pandas as pd
+    import numpy as np
+    if module not in _VEHICLE_MODULES:
+        raise HTTPException(status_code=400, detail="Invalid module")
+
+    vehicle_data: dict = {}
+    silver_path = os.path.join(_SILVER_ROOT, module)
+    if os.path.exists(silver_path):
+        pfiles = sorted(
+            [os.path.join(r, f) for r, _, ff in os.walk(silver_path) for f in ff if f.endswith(".parquet")],
+            key=os.path.getmtime, reverse=True,
+        )
+        dfs = []
+        for fp in pfiles[:20]:
+            try:
+                df = pd.read_parquet(fp)
+                if not df.empty and "source_id" in df.columns and "health_score" in df.columns:
+                    dfs.append(df[["source_id", "health_score"]])
+            except Exception:
+                pass
+        if dfs:
+            combined = pd.concat(dfs, ignore_index=True)
+            for vid, grp in combined.groupby("source_id"):
+                vehicle_data[str(vid)] = grp["health_score"].dropna().tolist()
+
+    if not vehicle_data and _PRESENTATION_MODE_ACTIVE and _DEMO_SILVER_CACHE:
+        for vid in _DEMO_VEHICLES:
+            if vid in _DEMO_SILVER_CACHE and module in _DEMO_SILVER_CACHE[vid]:
+                vehicle_data[vid] = [r["health_score"] for r in _DEMO_SILVER_CACHE[vid][module]]
+
+    alert_counts: dict = {}
+    if os.path.exists(_GOLD_ALERTS_DIR):
+        try:
+            files = [os.path.join(r, f) for r, _, ff in os.walk(_GOLD_ALERTS_DIR) for f in ff if f.endswith(".parquet")]
+            adfs = []
+            for fp in files:
+                try:
+                    df = pd.read_parquet(fp)
+                    if not df.empty:
+                        adfs.append(df)
+                except Exception:
+                    pass
+            if adfs:
+                adf = pd.concat(adfs, ignore_index=True)
+                if "source_id" in adf.columns and "module" in adf.columns:
+                    for vid, cnt in adf[adf["module"] == module].groupby("source_id").size().items():
+                        alert_counts[str(vid)] = int(cnt)
+        except Exception:
+            pass
+
+    rankings = []
+    for vid, scores in vehicle_data.items():
+        if not scores:
+            continue
+        arr = np.array(scores, dtype=float)
+        last50 = arr[-50:] if len(arr) >= 50 else arr
+        slope = float(np.polyfit(np.arange(len(last50)), last50, 1)[0]) if len(last50) > 1 else 0.0
+        rankings.append({
+            "vehicle_id": vid,
+            "avg_health": round(float(np.mean(arr)), 1),
+            "min_health": round(float(np.min(arr)), 1),
+            "trend_slope": round(slope, 4),
+            "total_pts": len(scores),
+            "alert_count": alert_counts.get(vid, 0),
+        })
+    rankings.sort(key=lambda x: x["avg_health"])
+    return {"module": module, "rankings": rankings}
+
+
+@router.get("/api/automotive/module-fleet-health/{module}")
+def get_module_fleet_health(module: str):
+    import pandas as pd
+    if module not in _VEHICLE_MODULES:
+        raise HTTPException(status_code=400, detail="Invalid module")
+
+    vehicle_pts: dict = {}
+    silver_path = os.path.join(_SILVER_ROOT, module)
+    if os.path.exists(silver_path):
+        pfiles = sorted(
+            [os.path.join(r, f) for r, _, ff in os.walk(silver_path) for f in ff if f.endswith(".parquet")],
+            key=os.path.getmtime, reverse=True,
+        )
+        dfs = []
+        for fp in pfiles[:20]:
+            try:
+                df = pd.read_parquet(fp)
+                if not df.empty and "source_id" in df.columns and "health_score" in df.columns:
+                    dfs.append(df)
+            except Exception:
+                pass
+        if dfs:
+            combined = pd.concat(dfs, ignore_index=True)
+            ts_col = next((c for c in ("inference_ts", "ingest_ts", "timestamp") if c in combined.columns), None)
+            if ts_col:
+                combined["_ts"] = pd.to_datetime(combined[ts_col], errors="coerce")
+                combined = combined.sort_values("_ts")
+                combined["ts"] = combined["_ts"].dt.strftime("%Y-%m-%d %H:%M")
+            else:
+                combined["ts"] = combined.index.astype(str)
+            for vid, grp in combined.groupby("source_id"):
+                pts = grp[["ts", "health_score"]].dropna()
+                factor = max(1, len(pts) // 200)
+                vehicle_pts[str(vid)] = [
+                    {"ts": r["ts"], "v": round(float(r["health_score"]), 1)}
+                    for _, r in pts.iloc[::factor].iterrows()
+                ]
+
+    if not vehicle_pts and _PRESENTATION_MODE_ACTIVE and _DEMO_SILVER_CACHE:
+        for vid in _DEMO_VEHICLES:
+            if vid in _DEMO_SILVER_CACHE and module in _DEMO_SILVER_CACHE[vid]:
+                rows = _DEMO_SILVER_CACHE[vid][module]
+                factor = max(1, len(rows) // 200)
+                vehicle_pts[vid] = [{"ts": r["timestamp"][5:16], "v": r["health_score"]} for r in rows[::factor]]
+
+    all_vids = list(vehicle_pts.keys())
+    if not all_vids:
+        return {"module": module, "vehicles": [], "series": []}
+
+    vid_map: dict = {vid: {pt["ts"]: pt["v"] for pt in pts} for vid, pts in vehicle_pts.items()}
+    all_ts = sorted({pt["ts"] for pts in vehicle_pts.values() for pt in pts})
+
+    result_rows = []
+    for ts in all_ts:
+        row: dict = {"ts": ts}
+        scores = []
+        for vid in all_vids:
+            v = vid_map[vid].get(ts)
+            if v is not None:
+                row[vid] = v
+                scores.append(v)
+        if scores:
+            row["fleet_avg"] = round(sum(scores) / len(scores), 1)
+        result_rows.append(row)
+
+    return {"module": module, "vehicles": all_vids, "series": result_rows}
+
+
+@router.get("/api/automotive/module-sensor-stats/{module}")
+def get_module_sensor_stats(module: str):
+    import pandas as pd
+    import numpy as np
+    if module not in _VEHICLE_MODULES:
+        raise HTTPException(status_code=400, detail="Invalid module")
+
+    specs = _KEY_SENSOR_SPECS.get(module, {})
+    sensor_keys = list(specs.keys())
+    vehicle_stats = []
+
+    bronze_path = os.path.join(_DELTA_ROOT, module)
+    if os.path.exists(bronze_path):
+        try:
+            part_dirs = [
+                d for d in os.listdir(bronze_path)
+                if d.startswith("source_id=") and os.path.isdir(os.path.join(bronze_path, d))
+            ]
+        except Exception:
+            part_dirs = []
+        for part_dir in sorted(part_dirs):
+            vid = part_dir[len("source_id="):]
+            part_path = os.path.join(bronze_path, part_dir)
+            pfiles = sorted(
+                [os.path.join(r, f) for r, _, ff in os.walk(part_path) for f in ff if f.endswith(".parquet")],
+                key=os.path.getmtime, reverse=True,
+            )
+            vdfs = []
+            for fp in pfiles[:5]:
+                try:
+                    df = pd.read_parquet(fp)
+                    if not df.empty:
+                        vdfs.append(df)
+                except Exception:
+                    pass
+            if vdfs:
+                grp = pd.concat(vdfs, ignore_index=True)
+                stat: dict = {"vehicle_id": vid}
+                for sk in sensor_keys:
+                    if sk in grp.columns:
+                        vals = grp[sk].dropna().values.astype(float)
+                        if len(vals) > 0:
+                            stat[f"{sk}_min"] = round(float(np.min(vals)), 3)
+                            stat[f"{sk}_p25"] = round(float(np.percentile(vals, 25)), 3)
+                            stat[f"{sk}_median"] = round(float(np.median(vals)), 3)
+                            stat[f"{sk}_p75"] = round(float(np.percentile(vals, 75)), 3)
+                            stat[f"{sk}_max"] = round(float(np.max(vals)), 3)
+                            stat[f"{sk}_mean"] = round(float(np.mean(vals)), 3)
+                vehicle_stats.append(stat)
+
+    if not vehicle_stats and _PRESENTATION_MODE_ACTIVE and _DEMO_SEED_CACHE:
+        for vid in _DEMO_VEHICLES:
+            if vid not in _DEMO_SEED_CACHE or module not in _DEMO_SEED_CACHE[vid]:
+                continue
+            seed_rows = _DEMO_SEED_CACHE[vid][module]
+            if not seed_rows:
+                continue
+            stat = {"vehicle_id": vid}
+            for sk in sensor_keys:
+                vals = np.array([r[sk] for r in seed_rows if sk in r and r[sk] is not None], dtype=float)
+                if len(vals) > 0:
+                    stat[f"{sk}_min"] = round(float(np.min(vals)), 3)
+                    stat[f"{sk}_p25"] = round(float(np.percentile(vals, 25)), 3)
+                    stat[f"{sk}_median"] = round(float(np.median(vals)), 3)
+                    stat[f"{sk}_p75"] = round(float(np.percentile(vals, 75)), 3)
+                    stat[f"{sk}_max"] = round(float(np.max(vals)), 3)
+                    stat[f"{sk}_mean"] = round(float(np.mean(vals)), 3)
+            vehicle_stats.append(stat)
+
+    return {"module": module, "vehicles": vehicle_stats, "sensor_keys": sensor_keys}
+
+
+@router.get("/api/automotive/module-sensor-fleet-history/{module}/{sensor}")
+def get_module_sensor_fleet_history(module: str, sensor: str):
+    import pandas as pd
+    if module not in _VEHICLE_MODULES:
+        raise HTTPException(status_code=400, detail="Invalid module")
+
+    vehicle_pts: dict = {}
+    bronze_path = os.path.join(_DELTA_ROOT, module)
+    if os.path.exists(bronze_path):
+        try:
+            part_dirs = [
+                d for d in os.listdir(bronze_path)
+                if d.startswith("source_id=") and os.path.isdir(os.path.join(bronze_path, d))
+            ]
+        except Exception:
+            part_dirs = []
+        for part_dir in sorted(part_dirs):
+            vid = part_dir[len("source_id="):]
+            part_path = os.path.join(bronze_path, part_dir)
+            pfiles = sorted(
+                [os.path.join(r, f) for r, _, ff in os.walk(part_path) for f in ff if f.endswith(".parquet")],
+                key=os.path.getmtime, reverse=True,
+            )
+            vdfs = []
+            for fp in pfiles[:5]:
+                try:
+                    df = pd.read_parquet(fp)
+                    if not df.empty and sensor in df.columns:
+                        ts_col = next((c for c in ("timestamp", "ingest_ts") if c in df.columns), None)
+                        if ts_col:
+                            df["_ts"] = pd.to_datetime(df[ts_col], errors="coerce")
+                            vdfs.append(df[["_ts", sensor]].dropna())
+                except Exception:
+                    pass
+            if vdfs:
+                grp = pd.concat(vdfs, ignore_index=True).sort_values("_ts")
+                factor = max(1, len(grp) // 200)
+                grp = grp.iloc[::factor]
+                grp["ts"] = grp["_ts"].dt.strftime("%Y-%m-%d %H:%M")
+                vehicle_pts[vid] = [{"ts": r["ts"], "v": round(float(r[sensor]), 3)} for _, r in grp.iterrows()]
+
+    if not vehicle_pts and _PRESENTATION_MODE_ACTIVE and _DEMO_SEED_CACHE:
+        for vid in _DEMO_VEHICLES:
+            if vid not in _DEMO_SEED_CACHE or module not in _DEMO_SEED_CACHE[vid]:
+                continue
+            rows = _DEMO_SEED_CACHE[vid][module]
+            factor = max(1, len(rows) // 200)
+            pts = [{"ts": r["timestamp"][5:16], "v": r.get(sensor, 0)} for r in rows[::factor] if sensor in r]
+            if pts:
+                vehicle_pts[vid] = pts
+
+    all_vids = list(vehicle_pts.keys())
+    if not all_vids:
+        return {"module": module, "sensor": sensor, "vehicles": [], "series": []}
+
+    vid_map: dict = {vid: {pt["ts"]: pt["v"] for pt in pts} for vid, pts in vehicle_pts.items()}
+    all_ts = sorted({pt["ts"] for pts in vehicle_pts.values() for pt in pts})
+
+    result_rows = []
+    for ts in all_ts:
+        row: dict = {"ts": ts}
+        for vid in all_vids:
+            v = vid_map[vid].get(ts)
+            if v is not None:
+                row[vid] = v
+        result_rows.append(row)
+
+    return {"module": module, "sensor": sensor, "vehicles": all_vids, "series": result_rows}
+
+
+@router.get("/api/automotive/module-top-features/{module}")
+def get_module_top_features(module: str):
+    import pandas as pd
+    if module not in _VEHICLE_MODULES:
+        raise HTTPException(status_code=400, detail="Invalid module")
+
+    feature_totals: dict = {}
+    feature_counts: dict = {}
+
+    silver_path = os.path.join(_SILVER_ROOT, module)
+    if os.path.exists(silver_path):
+        pfiles = sorted(
+            [os.path.join(r, f) for r, _, ff in os.walk(silver_path) for f in ff if f.endswith(".parquet")],
+            key=os.path.getmtime, reverse=True,
+        )
+        dfs = []
+        for fp in pfiles[:20]:
+            try:
+                df = pd.read_parquet(fp)
+                if not df.empty and "top_features" in df.columns:
+                    dfs.append(df[["top_features"]])
+            except Exception:
+                pass
+        if dfs:
+            combined = pd.concat(dfs, ignore_index=True)
+            for raw in combined["top_features"].dropna():
+                try:
+                    feats = json.loads(str(raw))
+                    for f, v in feats.items():
+                        feature_totals[f] = feature_totals.get(f, 0.0) + float(v)
+                        feature_counts[f] = feature_counts.get(f, 0) + 1
+                except Exception:
+                    pass
+
+    if not feature_totals and _PRESENTATION_MODE_ACTIVE and _DEMO_SILVER_CACHE:
+        for vid in _DEMO_VEHICLES:
+            if vid not in _DEMO_SILVER_CACHE or module not in _DEMO_SILVER_CACHE[vid]:
+                continue
+            for row in _DEMO_SILVER_CACHE[vid][module]:
+                try:
+                    feats = json.loads(str(row.get("top_features", "{}")))
+                    for f, v in feats.items():
+                        feature_totals[f] = feature_totals.get(f, 0.0) + float(v)
+                        feature_counts[f] = feature_counts.get(f, 0) + 1
+                except Exception:
+                    pass
+
+    features = []
+    for f, total in feature_totals.items():
+        count = feature_counts.get(f, 1)
+        features.append({
+            "feature": f,
+            "total_score": round(total, 4),
+            "avg_score": round(total / count, 4),
+            "occurrence_count": count,
+        })
+    features.sort(key=lambda x: x["total_score"], reverse=True)
+    return {"module": module, "features": features[:20]}
+
+
+@router.get("/api/automotive/dtc-sensor-evidence/{vehicle}/{module}/{sensor}")
+def get_dtc_sensor_evidence(vehicle: str, module: str, sensor: str, around_ts: str = "", window: int = 60):
+    import pandas as pd
+    if module not in _VEHICLE_MODULES:
+        raise HTTPException(status_code=400, detail="Invalid module")
+
+    rows: list = []
+    data_source = "none"
+
+    partition_path = os.path.join(_DELTA_ROOT, module, f"source_id={vehicle}")
+    if os.path.exists(partition_path):
+        pfiles = sorted(
+            [os.path.join(r, f) for r, _, ff in os.walk(partition_path) for f in ff if f.endswith(".parquet")],
+            key=os.path.getmtime, reverse=True,
+        )
+        dfs = []
+        for fp in pfiles[:20]:
+            try:
+                df = pd.read_parquet(fp)
+                if not df.empty and sensor in df.columns:
+                    dfs.append(df)
+            except Exception:
+                pass
+        if dfs:
+            combined = pd.concat(dfs, ignore_index=True)
+            ts_col = next((c for c in ("timestamp", "ingest_ts") if c in combined.columns), None)
+            if ts_col:
+                combined["_ts"] = pd.to_datetime(combined[ts_col], errors="coerce")
+                if combined["_ts"].dt.tz is not None:
+                    combined["_ts"] = combined["_ts"].dt.tz_localize(None)
+                if around_ts:
+                    try:
+                        center = pd.to_datetime(around_ts)
+                        half = pd.Timedelta(minutes=window // 2)
+                        combined = combined[
+                            (combined["_ts"] >= center - half) & (combined["_ts"] <= center + half)
+                        ]
+                    except Exception:
+                        pass
+                combined = combined.sort_values("_ts")
+                combined["ts"] = combined["_ts"].dt.strftime("%Y-%m-%d %H:%M")
+                out = combined[["ts", sensor]].dropna()
+                rows = [{"ts": r["ts"], "value": round(float(r[sensor]), 3)} for _, r in out.iterrows()]
+                data_source = "live"
+
+    if not rows and _PRESENTATION_MODE_ACTIVE and vehicle in _DEMO_SEED_CACHE:
+        demo = _DEMO_SEED_CACHE[vehicle].get(module, [])
+        rows = [{"ts": r["timestamp"][5:16], "value": r.get(sensor, 0)} for r in demo[-200:] if sensor in r]
+        data_source = "demo"
+
+    return {
+        "vehicle": vehicle, "module": module, "sensor": sensor,
+        "data": rows, "data_source": data_source,
+        "around_ts": around_ts, "window_minutes": window,
+    }
+
+
+@router.get("/api/automotive/dtc/fleet-distribution")
+def get_dtc_fleet_distribution():
+    if not os.path.exists(_DTC_HISTORY_FILE):
+        return {"distribution": []}
+    try:
+        with open(_DTC_HISTORY_FILE, "r") as fh:
+            all_runs: list = json.load(fh)
+    except Exception:
+        return {"distribution": []}
+
+    code_map: dict = {}
+    for run in all_runs:
+        for trigger in run.get("triggers", []):
+            code = trigger.get("code", "UNKNOWN")
+            sev = trigger.get("severity", "WARNING")
+            if code not in code_map:
+                code_map[code] = {"code": code, "severity": sev, "count": 0, "vehicles": set()}
+            code_map[code]["count"] += 1
+            code_map[code]["vehicles"].add(run.get("source_id", ""))
+
+    distribution = [
+        {"code": v["code"], "severity": v["severity"], "count": v["count"], "vehicle_count": len(v["vehicles"])}
+        for v in code_map.values()
+    ]
+    distribution.sort(key=lambda x: x["count"], reverse=True)
+    return {"distribution": distribution[:30]}
+
+
+@router.get("/api/automotive/dtc/history")
+def get_dtc_all_history():
+    if not os.path.exists(_DTC_HISTORY_FILE):
+        return {"runs": []}
+    try:
+        with open(_DTC_HISTORY_FILE, "r") as fh:
+            all_runs: list = json.load(fh)
+    except Exception:
+        return {"runs": []}
+    all_runs.sort(key=lambda r: r.get("run_ts", ""), reverse=True)
+    return {"runs": all_runs[:100]}
+
+
+@router.get("/api/automotive/dtc-master")
+def get_dtc_master_data():
+    try:
+        with open(_DTC_MASTER_FILE, "r") as fh:
+            return json.load(fh)
+    except Exception:
+        return {"modules": {}}

@@ -5,6 +5,8 @@ import PsychologyIcon from '@mui/icons-material/Psychology';
 import HealthAndSafetyIcon from '@mui/icons-material/HealthAndSafety';
 import WarningAmberIcon from '@mui/icons-material/WarningAmber';
 import DirectionsCarIcon from '@mui/icons-material/DirectionsCar';
+import GridViewIcon from '@mui/icons-material/GridView';
+import BugReportIcon from '@mui/icons-material/BugReport';
 import { useStore } from '../store';
 
 const DRAWER_WIDTH = 240;
@@ -15,6 +17,8 @@ const menuItems = [
   { text: 'Vehicle Health', path: '/gold', icon: <HealthAndSafetyIcon />, index: 2 },
   { text: 'Alerts Management', path: '/alerts', icon: <WarningAmberIcon />, index: 3 },
   { text: 'Automotive Dive', path: '/automotive', icon: <DirectionsCarIcon />, index: 4 },
+  { text: 'Fleet Command', path: '/fleet', icon: <GridViewIcon />, index: 5 },
+  { text: 'DTC Investigation', path: '/dtc', icon: <BugReportIcon />, index: 6 },
 ];
 
 export default function Layout() {

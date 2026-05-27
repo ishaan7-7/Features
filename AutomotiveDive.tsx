@@ -13,6 +13,9 @@ import 'ag-grid-community/styles/ag-theme-balham.css';
 import { useQuery } from '@tanstack/react-query';
 import axios from 'axios';
 import { useStore } from '../store';
+import EChart from '../components/EChart';
+import type { EChartsOption } from 'echarts';
+import TimeRangePicker from '../components/TimeRangePicker';
 import {
   LineChart, Line, BarChart, Bar, AreaChart, Area, XAxis, YAxis, CartesianGrid,
   Tooltip, Legend, ResponsiveContainer, ReferenceLine,
@@ -223,6 +226,7 @@ export default function AutomotiveDive() {
   const [selectedModule, setSelectedModule] = useState<string>(ALL_MODULES.includes(_initModule) ? _initModule : 'engine');
   const [analysisModule, setAnalysisModule] = useState<string>('engine');
   const [analysisKey, setAnalysisKey] = useState<string>('');
+  const [analysisTimeRange, setAnalysisTimeRange] = useState<number>(168);
   const [dtcResult, setDtcResult] = useState<any>(null);
   const [dtcRunning, setDtcRunning] = useState(false);
 
@@ -287,6 +291,44 @@ export default function AutomotiveDive() {
     queryFn: () =>
       axios.get(`${API}/api/automotive/sensor-history/${selectedVehicle}/${analysisModule}`).then((r) => r.data),
     enabled: !!selectedVehicle && activeTab === 'module',
+    refetchInterval: false,
+  });
+
+  const moduleFleetRankingQuery = useQuery({
+    queryKey: ['moduleFleetRanking', analysisModule],
+    queryFn: () => axios.get(`${API}/api/automotive/module-fleet-ranking/${analysisModule}`).then((r) => r.data),
+    enabled: activeTab === 'module',
+    refetchInterval: false,
+  });
+
+  const moduleFleetHealthQuery = useQuery({
+    queryKey: ['moduleFleetHealth', analysisModule],
+    queryFn: () => axios.get(`${API}/api/automotive/module-fleet-health/${analysisModule}`).then((r) => r.data),
+    enabled: activeTab === 'module',
+    refetchInterval: false,
+  });
+
+  const moduleSensorStatsQuery = useQuery({
+    queryKey: ['moduleSensorStats', analysisModule],
+    queryFn: () => axios.get(`${API}/api/automotive/module-sensor-stats/${analysisModule}`).then((r) => r.data),
+    enabled: activeTab === 'module',
+    refetchInterval: false,
+  });
+
+  const moduleSensorFleetHistoryQuery = useQuery({
+    queryKey: ['moduleSensorFleetHistory', analysisModule, analysisKey],
+    queryFn: () =>
+      axios
+        .get(`${API}/api/automotive/module-sensor-fleet-history/${analysisModule}/${analysisKey}`)
+        .then((r) => r.data),
+    enabled: activeTab === 'module' && !!analysisKey,
+    refetchInterval: false,
+  });
+
+  const moduleTopFeaturesQuery = useQuery({
+    queryKey: ['moduleTopFeatures', analysisModule],
+    queryFn: () => axios.get(`${API}/api/automotive/module-top-features/${analysisModule}`).then((r) => r.data),
+    enabled: activeTab === 'module',
     refetchInterval: false,
   });
 
@@ -397,6 +439,169 @@ export default function AutomotiveDive() {
 
   const chartGroups = MODULE_CHART_GROUPS[selectedModule] || [];
   const kpiFields = MODULE_KPI_FIELDS[selectedModule] || [];
+
+  const moduleRankings: any[] = moduleFleetRankingQuery.data?.rankings || [];
+
+  const rankingChartData = useMemo(
+    () => moduleRankings.map((r: any) => ({ vehicle_id: r.vehicle_id, avg_health: r.avg_health })),
+    [moduleRankings],
+  );
+
+  const fleetHealthTrendOption: EChartsOption = useMemo(() => {
+    const allVids: string[] = moduleFleetHealthQuery.data?.vehicles || [];
+    const rawSeries: any[] = moduleFleetHealthQuery.data?.series || [];
+    const cutoff = analysisTimeRange < 8760
+      ? new Date(Date.now() - analysisTimeRange * 60 * 60 * 1000)
+      : null;
+    const series = cutoff ? rawSeries.filter((r: any) => new Date(r.ts) >= cutoff) : rawSeries;
+    const VID_COLORS = ['#e57373', '#ffb74d', '#81c784', '#ba68c8', '#4dd0e1', '#42a5f5', '#ff8a65'];
+
+    return {
+      tooltip: {
+        trigger: 'axis',
+        backgroundColor: '#fff',
+        borderColor: '#e0e0e0',
+        borderWidth: 1,
+        padding: [8, 12],
+        textStyle: { fontFamily: 'monospace', fontSize: 11 },
+        axisPointer: { type: 'cross', label: { backgroundColor: '#424242' } },
+      },
+      legend: {
+        data: [...allVids, 'fleet_avg'],
+        textStyle: { fontFamily: 'monospace', fontSize: 10 },
+        itemHeight: 10,
+        bottom: 28,
+      },
+      dataZoom: [
+        { type: 'inside', xAxisIndex: 0 },
+        { type: 'slider', xAxisIndex: 0, bottom: 4, height: 18 },
+      ],
+      grid: { top: 36, right: 16, bottom: 72, left: 50 },
+      xAxis: {
+        type: 'category',
+        data: series.map((r: any) => r.ts),
+        axisLabel: { fontFamily: 'monospace', fontSize: 10, color: '#616161', rotate: 0 },
+        axisLine: { lineStyle: { color: '#bdbdbd' } },
+        axisTick: { show: false },
+        splitLine: { show: false },
+      },
+      yAxis: {
+        type: 'value',
+        min: 0,
+        max: 100,
+        axisLabel: { fontFamily: 'monospace', fontSize: 10, color: '#616161', formatter: '{value}%' },
+        axisLine: { show: false },
+        axisTick: { show: false },
+        splitLine: { lineStyle: { type: 'dashed', color: '#eeeeee' } },
+      },
+      series: [
+        ...allVids.map((vid: string, i: number) => ({
+          name: vid,
+          type: 'line' as const,
+          data: series.map((r: any) => r[vid] ?? null),
+          symbol: 'none',
+          lineStyle: { color: VID_COLORS[i % VID_COLORS.length], width: 1.5 },
+          itemStyle: { color: VID_COLORS[i % VID_COLORS.length] },
+          smooth: false,
+          connectNulls: false,
+        })),
+        {
+          name: 'fleet_avg',
+          type: 'line' as const,
+          data: series.map((r: any) => r.fleet_avg ?? null),
+          symbol: 'none',
+          lineStyle: { color: '#1976d2', width: 3, type: 'dashed' },
+          itemStyle: { color: '#1976d2' },
+          smooth: false,
+          markLine: {
+            silent: true,
+            symbol: 'none',
+            data: [
+              { yAxis: 60, lineStyle: { color: '#d32f2f', type: 'dashed', width: 1 }, label: { formatter: 'CRITICAL', fontSize: 9, color: '#d32f2f', fontFamily: 'monospace' } },
+              { yAxis: 80, lineStyle: { color: '#ed6c02', type: 'dashed', width: 1 }, label: { formatter: 'WARNING', fontSize: 9, color: '#ed6c02', fontFamily: 'monospace' } },
+            ],
+          },
+          markArea: {
+            silent: true,
+            data: [
+              [{ yAxis: 0, itemStyle: { color: 'rgba(211,47,47,0.04)' } }, { yAxis: 60 }],
+              [{ yAxis: 60, itemStyle: { color: 'rgba(237,108,2,0.03)' } }, { yAxis: 80 }],
+            ],
+          },
+        },
+      ],
+    };
+  }, [moduleFleetHealthQuery.data, analysisTimeRange]);
+
+  const sensorBoxData = useMemo(() => {
+    const vehicles: any[] = moduleSensorStatsQuery.data?.vehicles || [];
+    const sk = currentAnalysisKey;
+    return vehicles.map((v: any) => ({
+      vehicle_id: v.vehicle_id,
+      min: v[`${sk}_min`] ?? 0,
+      p25: v[`${sk}_p25`] ?? 0,
+      median: v[`${sk}_median`] ?? 0,
+      p75: v[`${sk}_p75`] ?? 0,
+      max: v[`${sk}_max`] ?? 0,
+    }));
+  }, [moduleSensorStatsQuery.data, currentAnalysisKey]);
+
+  const sensorFleetVehicles: string[] = moduleFleetHealthQuery.data?.vehicles || [];
+
+  const sensorFleetHistorySeries = useMemo(() => {
+    return moduleSensorFleetHistoryQuery.data?.vehicles || [] as string[];
+  }, [moduleSensorFleetHistoryQuery.data]);
+
+  const sensorFleetHistoryData = useMemo(() => {
+    const raw: any[] = moduleSensorFleetHistoryQuery.data?.series || [];
+    const cutoff = analysisTimeRange < 8760
+      ? new Date(Date.now() - analysisTimeRange * 60 * 60 * 1000)
+      : null;
+    return cutoff ? raw.filter((r: any) => new Date(r.ts) >= cutoff) : raw;
+  }, [moduleSensorFleetHistoryQuery.data, analysisTimeRange]);
+
+  const topFeaturesData = useMemo(
+    () => (moduleTopFeaturesQuery.data?.features || []).slice(0, 12) as any[],
+    [moduleTopFeaturesQuery.data],
+  );
+
+  const rankingColDefs = useMemo<ColDef[]>(() => [
+    {
+      field: 'vehicle_id', headerName: 'VEHICLE', width: 120, pinned: 'left',
+      cellRenderer: (params: any) => (
+        <button
+          onClick={() => { setSelectedVehicle(params.value); setSelectedModule(analysisModule); setActiveTab('vehicle'); }}
+          style={{ background: 'none', border: 'none', color: '#1976d2', fontWeight: 'bold', fontFamily: 'monospace', fontSize: '11px', cursor: 'pointer', padding: 0 }}
+        >
+          {params.value}
+        </button>
+      ),
+    },
+    {
+      field: 'avg_health', headerName: 'AVG HEALTH', width: 120, sortable: true,
+      cellStyle: (params: any) => ({ fontWeight: 'bold', color: params.value < 60 ? '#d32f2f' : params.value < 80 ? '#f57c00' : '#388e3c' }),
+      valueFormatter: (params: any) => `${params.value}%`,
+    },
+    {
+      field: 'min_health', headerName: 'MIN HEALTH', width: 110, sortable: true,
+      cellStyle: (params: any) => ({ color: params.value < 60 ? '#d32f2f' : '#424242' }),
+      valueFormatter: (params: any) => `${params.value}%`,
+    },
+    {
+      field: 'trend_slope', headerName: 'TREND', width: 100, sortable: true,
+      cellRenderer: (params: any) => {
+        const s = params.value ?? 0;
+        const arrow = s > 0.05 ? '▲' : s < -0.05 ? '▼' : '→';
+        const color = s > 0.05 ? '#388e3c' : s < -0.05 ? '#d32f2f' : '#757575';
+        return <span style={{ color, fontWeight: 'bold', fontFamily: 'monospace' }}>{arrow} {Math.abs(s).toFixed(3)}</span>;
+      },
+    },
+    {
+      field: 'alert_count', headerName: 'ALERTS', width: 90, sortable: true,
+      cellStyle: (params: any) => ({ fontWeight: 'bold', color: params.value > 0 ? '#d32f2f' : '#388e3c' }),
+    },
+    { field: 'total_pts', headerName: 'DATA PTS', width: 100, sortable: true },
+  ], [analysisModule]);
 
   const runDtcAnalysis = async () => {
     if (!selectedVehicle) return;
@@ -1141,8 +1346,10 @@ export default function AutomotiveDive() {
 
       {/* ── MODULE ANALYSIS ── */}
       {activeTab === 'module' && (
-        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2, flex: 1, minHeight: 0 }}>
-          <Paper sx={{ p: 1.5, borderRadius: 0, display: 'flex', alignItems: 'center', gap: 2 }}>
+        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2, flex: 1, minHeight: 0, overflow: 'auto' }}>
+
+          {/* Controls */}
+          <Paper sx={{ p: 1.5, borderRadius: 0, display: 'flex', alignItems: 'center', gap: 2, flexWrap: 'wrap', flexShrink: 0 }}>
             <Typography variant="body2" sx={{ fontWeight: 'bold' }}>MODULE:</Typography>
             <ToggleButtonGroup value={analysisModule} exclusive
               onChange={(_e, val) => { if (val) { setAnalysisModule(val); setAnalysisKey(''); } }}
@@ -1163,9 +1370,12 @@ export default function AutomotiveDive() {
                 </Select>
               </FormControl>
             )}
+
+            <TimeRangePicker value={analysisTimeRange} onChange={setAnalysisTimeRange} minWidth={160} />
           </Paper>
 
-          <Box sx={{ display: 'flex', gap: 2, height: 300, minHeight: 0 }}>
+          {/* ── SECTION: Fleet Sensor Stats (existing crossfleet bar charts) ── */}
+          <Box sx={{ display: 'flex', gap: 2, height: 280 }}>
             <Paper sx={{ flex: 1, p: 2, borderRadius: 0, display: 'flex', flexDirection: 'column' }}>
               <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161', mb: 1 }}>
                 FLEET AVERAGE — {currentAnalysisKey.replace(/_/g, ' ').toUpperCase()} (BRONZE)
@@ -1177,7 +1387,6 @@ export default function AutomotiveDive() {
                     <XAxis dataKey="vehicle_id" tick={{ fontSize: 11, fontWeight: 600, fill: '#424242' }} axisLine={{ stroke: '#bdbdbd' }} tickLine={false} />
                     <YAxis tick={axisStyle} axisLine={{ stroke: '#bdbdbd' }} tickLine={false} />
                     <Tooltip contentStyle={{ borderRadius: 0, fontSize: '11px' }} />
-                    <Legend wrapperStyle={{ fontSize: '11px', fontWeight: 'bold' }} />
                     <Bar dataKey="avg" name="Average" fill={MODULE_COLORS[analysisModule]} isAnimationActive={false} />
                   </BarChart>
                 </ResponsiveContainer>
@@ -1204,16 +1413,14 @@ export default function AutomotiveDive() {
             </Paper>
           </Box>
 
-          {/* Inline timeline for selected vehicle+module */}
+          {/* ── SECTION: Inline vehicle sensor timeline ── */}
           <Paper sx={{ p: 1.5, borderRadius: 0, height: 260, display: 'flex', flexDirection: 'column' }}>
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, mb: 1 }}>
               <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161' }}>
-                SENSOR TIMELINE — {analysisModule.toUpperCase()} — switch to VEHICLE DEEP DIVE for full drill-down
+                SENSOR TIMELINE — {analysisModule.toUpperCase()}
               </Typography>
               <FormControl size="small" sx={{ minWidth: 160 }}>
-                <Select value={selectedVehicle}
-                  onChange={(e) => setSelectedVehicle(e.target.value)}
-                  displayEmpty sx={{ borderRadius: 0 }}>
+                <Select value={selectedVehicle} onChange={(e) => setSelectedVehicle(e.target.value)} displayEmpty sx={{ borderRadius: 0 }}>
                   {vehicles.map((v: any) => <MenuItem key={v.vehicle_id} value={v.vehicle_id}>{v.vehicle_id}</MenuItem>)}
                 </Select>
               </FormControl>
@@ -1233,7 +1440,201 @@ export default function AutomotiveDive() {
               ) : (
                 <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%' }}>
                   <Typography variant="caption" sx={{ color: '#9e9e9e' }}>
-                    {!selectedVehicle ? 'Select a vehicle above' : moduleTimelineQuery.isLoading ? 'Loading…' : 'No sensor data for this vehicle/module'}
+                    {!selectedVehicle ? 'Select a vehicle' : moduleTimelineQuery.isLoading ? 'Loading…' : 'No sensor data'}
+                  </Typography>
+                </Box>
+              )}
+            </Box>
+          </Paper>
+
+          {/* ── SECTION DIVIDER ── */}
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, my: 0.5 }}>
+            <Box sx={{ flex: 1, height: '1px', bgcolor: '#e0e0e0' }} />
+            <Typography variant="caption" sx={{ color: '#9e9e9e', fontWeight: 'bold', fontFamily: 'monospace', letterSpacing: 1, whiteSpace: 'nowrap' }}>
+              FLEET HEALTH ANALYSIS
+            </Typography>
+            <Box sx={{ flex: 1, height: '1px', bgcolor: '#e0e0e0' }} />
+          </Box>
+
+          {/* ── SECTION: Fleet Health Ranking ── */}
+          <Box sx={{ display: 'flex', gap: 2 }}>
+            <Paper sx={{ flex: 1, p: 1.5, borderRadius: 0, height: 320, display: 'flex', flexDirection: 'column' }}>
+              <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161', mb: 1 }}>
+                VEHICLE HEALTH RANKING — {analysisModule.toUpperCase()} AVG (SILVER)
+              </Typography>
+              <Box sx={{ flex: 1, minHeight: 0 }}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={rankingChartData} layout="vertical" margin={{ top: 0, right: 48, left: 0, bottom: 0 }}>
+                    <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="#eeeeee" />
+                    <XAxis type="number" domain={[0, 100]} tick={axisStyle} axisLine={{ stroke: '#bdbdbd' }} tickLine={false} tickFormatter={(v) => `${v}%`} />
+                    <YAxis type="category" dataKey="vehicle_id" tick={{ fontSize: 11, fontWeight: 600, fill: '#424242', fontFamily: 'monospace' }} axisLine={false} tickLine={false} width={65} />
+                    <Tooltip contentStyle={{ borderRadius: 0, fontSize: '11px' }} formatter={(v: number) => `${v}%`} />
+                    <ReferenceLine x={60} stroke="#d32f2f" strokeDasharray="4 4" />
+                    <ReferenceLine x={80} stroke="#ed6c02" strokeDasharray="4 4" />
+                    <Bar dataKey="avg_health" name="Avg Health"
+                      isAnimationActive={false}
+                      label={{ position: 'right', fontSize: 10, fontWeight: 'bold', fill: '#424242', fontFamily: 'monospace', formatter: (v: number) => `${v}%` }}
+                      fill={MODULE_COLORS[analysisModule]}
+                    />
+                  </BarChart>
+                </ResponsiveContainer>
+              </Box>
+            </Paper>
+
+            <Paper sx={{ flex: 1.2, borderRadius: 0, display: 'flex', flexDirection: 'column', p: 0 }}>
+              <Box sx={{ p: 1.5, borderBottom: '1px solid #e0e0e0' }}>
+                <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161' }}>
+                  VEHICLE RANKING TABLE — click vehicle to open deep dive
+                </Typography>
+              </Box>
+              <Box className="ag-theme-balham" sx={{ flexGrow: 1 }}>
+                <AgGridReact
+                  rowData={moduleRankings}
+                  columnDefs={rankingColDefs}
+                  defaultColDef={{ resizable: true, sortable: true }}
+                  rowHeight={28}
+                />
+              </Box>
+            </Paper>
+          </Box>
+
+          {/* ── SECTION: Multi-vehicle health trend (ECharts with zoom) ── */}
+          <Paper sx={{ p: 1.5, borderRadius: 0, height: 380, display: 'flex', flexDirection: 'column' }}>
+            <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161', mb: 0.5 }}>
+              FLEET HEALTH TREND — {analysisModule.toUpperCase()} ALL VEHICLES &nbsp;
+              <span style={{ color: '#9e9e9e', fontWeight: 'normal' }}>(SILVER · dashed = fleet avg · scroll or drag to zoom)</span>
+            </Typography>
+            <Box sx={{ flex: 1, minHeight: 0 }}>
+              <EChart
+                option={fleetHealthTrendOption}
+                loading={moduleFleetHealthQuery.isLoading}
+                empty={(moduleFleetHealthQuery.data?.series?.length ?? 0) === 0}
+                emptyText="No silver data — start the streaming pipeline"
+              />
+            </Box>
+          </Paper>
+
+          {/* ── SECTION DIVIDER ── */}
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, my: 0.5 }}>
+            <Box sx={{ flex: 1, height: '1px', bgcolor: '#e0e0e0' }} />
+            <Typography variant="caption" sx={{ color: '#9e9e9e', fontWeight: 'bold', fontFamily: 'monospace', letterSpacing: 1, whiteSpace: 'nowrap' }}>
+              SENSOR FLEET ANALYSIS
+            </Typography>
+            <Box sx={{ flex: 1, height: '1px', bgcolor: '#e0e0e0' }} />
+          </Box>
+
+          {/* ── SECTION: Sensor distribution stats table (p25/median/p75 per vehicle) ── */}
+          <Paper sx={{ p: 1.5, borderRadius: 0 }}>
+            <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161', mb: 1, display: 'block' }}>
+              SENSOR DISTRIBUTION — {currentAnalysisKey.replace(/_/g, ' ').toUpperCase()} PER VEHICLE &nbsp;
+              <span style={{ color: '#9e9e9e', fontWeight: 'normal' }}>(BRONZE · percentile statistics)</span>
+            </Typography>
+            {sensorBoxData.length > 0 ? (
+              <Box sx={{ overflowX: 'auto' }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontFamily: 'monospace', fontSize: '11px' }}>
+                  <thead>
+                    <tr style={{ borderBottom: '2px solid #bdbdbd' }}>
+                      {['VEHICLE', 'MIN', 'P25', 'MEDIAN', 'P75', 'MAX', 'RANGE'].map((h) => (
+                        <th key={h} style={{ textAlign: 'left', padding: '4px 12px', color: '#616161', fontWeight: 700, whiteSpace: 'nowrap' }}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {sensorBoxData.map((row: any, i: number) => {
+                      const range = (row.max - row.min).toFixed(3);
+                      return (
+                        <tr key={row.vehicle_id} style={{ borderBottom: '1px solid #f0f0f0', background: i % 2 === 0 ? '#fafafa' : 'white' }}>
+                          <td style={{ padding: '5px 12px', fontWeight: 600, color: '#1976d2', cursor: 'pointer' }}
+                            onClick={() => { setSelectedVehicle(row.vehicle_id); setSelectedModule(analysisModule); setActiveTab('vehicle'); }}>
+                            {row.vehicle_id}
+                          </td>
+                          <td style={{ padding: '5px 12px', color: '#757575' }}>{row.min.toFixed(3)}</td>
+                          <td style={{ padding: '5px 12px' }}>{row.p25.toFixed(3)}</td>
+                          <td style={{ padding: '5px 12px', fontWeight: 'bold' }}>{row.median.toFixed(3)}</td>
+                          <td style={{ padding: '5px 12px' }}>{row.p75.toFixed(3)}</td>
+                          <td style={{ padding: '5px 12px', color: '#757575' }}>{row.max.toFixed(3)}</td>
+                          <td style={{ padding: '5px 12px', color: '#9e9e9e' }}>{range}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </Box>
+            ) : (
+              <Typography variant="caption" sx={{ color: '#9e9e9e' }}>
+                {moduleSensorStatsQuery.isLoading ? 'Loading…' : 'No bronze sensor data'}
+              </Typography>
+            )}
+          </Paper>
+
+          {/* ── SECTION: Sensor fleet history comparison ── */}
+          <Paper sx={{ p: 1.5, borderRadius: 0, height: 300, display: 'flex', flexDirection: 'column' }}>
+            <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161', mb: 0.5 }}>
+              SENSOR COMPARISON — {currentAnalysisKey.replace(/_/g, ' ').toUpperCase()} ALL VEHICLES &nbsp;
+              <span style={{ color: '#9e9e9e', fontWeight: 'normal' }}>(BRONZE)</span>
+            </Typography>
+            <Box sx={{ flex: 1, minHeight: 0 }}>
+              {sensorFleetHistoryData.length > 0 && sensorFleetHistorySeries.length > 0 ? (
+                <ResponsiveContainer width="100%" height="100%">
+                  <LineChart data={sensorFleetHistoryData} margin={{ top: 4, right: 16, left: -24, bottom: 0 }}>
+                    <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#eeeeee" />
+                    <XAxis dataKey="ts" tick={axisStyle} axisLine={{ stroke: '#bdbdbd' }} tickLine={false} minTickGap={40} />
+                    <YAxis tick={axisStyle} axisLine={{ stroke: '#bdbdbd' }} tickLine={false} />
+                    <Tooltip contentStyle={{ borderRadius: 0, fontSize: '11px', padding: '6px 10px' }} />
+                    <Legend wrapperStyle={{ fontSize: '10px', fontWeight: 'bold' }} />
+                    {(sensorFleetHistorySeries as string[]).map((vid, i) => (
+                      <Line key={vid} type="monotone" dataKey={vid} name={vid} stroke={SHAP_COLORS[i % SHAP_COLORS.length]}
+                        strokeWidth={1.5} dot={false} isAnimationActive={false} connectNulls={false} />
+                    ))}
+                  </LineChart>
+                </ResponsiveContainer>
+              ) : (
+                <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%' }}>
+                  <Typography variant="caption" sx={{ color: '#9e9e9e' }}>
+                    {moduleSensorFleetHistoryQuery.isLoading ? 'Loading…' : 'Select a sensor to compare across fleet'}
+                  </Typography>
+                </Box>
+              )}
+            </Box>
+          </Paper>
+
+          {/* ── SECTION DIVIDER ── */}
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, my: 0.5 }}>
+            <Box sx={{ flex: 1, height: '1px', bgcolor: '#e0e0e0' }} />
+            <Typography variant="caption" sx={{ color: '#9e9e9e', fontWeight: 'bold', fontFamily: 'monospace', letterSpacing: 1, whiteSpace: 'nowrap' }}>
+              ANOMALY INTELLIGENCE
+            </Typography>
+            <Box sx={{ flex: 1, height: '1px', bgcolor: '#e0e0e0' }} />
+          </Box>
+
+          {/* ── SECTION: Fleet top features ── */}
+          <Paper sx={{ p: 1.5, borderRadius: 0, height: 320, display: 'flex', flexDirection: 'column' }}>
+            <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161', mb: 0.5 }}>
+              FLEET TOP ANOMALY DRIVERS — {analysisModule.toUpperCase()} &nbsp;
+              <span style={{ color: '#9e9e9e', fontWeight: 'normal' }}>(LSTM RECONSTRUCTION ERROR TOTALS · SILVER · aggregated across all vehicles)</span>
+            </Typography>
+            <Box sx={{ flex: 1, minHeight: 0 }}>
+              {topFeaturesData.length > 0 ? (
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={topFeaturesData} layout="vertical" margin={{ top: 0, right: 60, left: 0, bottom: 0 }}>
+                    <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="#eeeeee" />
+                    <XAxis type="number" tick={axisStyle} axisLine={{ stroke: '#bdbdbd' }} tickLine={false} />
+                    <YAxis type="category" dataKey="feature" tick={{ fontSize: 10, fontWeight: 600, fill: '#424242', fontFamily: 'monospace' }}
+                      axisLine={false} tickLine={false} width={200}
+                      tickFormatter={(v: string) => v.replace(/_/g, ' ')} />
+                    <Tooltip
+                      contentStyle={{ borderRadius: 0, fontSize: '11px', fontFamily: 'monospace' }}
+                      formatter={(v: number, name: string) => [v.toFixed(4), name]}
+                      labelFormatter={(l: string) => l.replace(/_/g, ' ')}
+                    />
+                    <Bar dataKey="total_score" name="Total Error" fill={MODULE_COLORS[analysisModule]} isAnimationActive={false}
+                      label={{ position: 'right', fontSize: 9, fontWeight: 'bold', fill: '#616161', fontFamily: 'monospace', formatter: (v: number) => v.toFixed(4) }} />
+                  </BarChart>
+                </ResponsiveContainer>
+              ) : (
+                <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%' }}>
+                  <Typography variant="caption" sx={{ color: '#9e9e9e' }}>
+                    {moduleTopFeaturesQuery.isLoading ? 'Loading…' : 'No silver feature data for this module'}
                   </Typography>
                 </Box>
               )}
