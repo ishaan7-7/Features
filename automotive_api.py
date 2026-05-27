@@ -175,15 +175,23 @@ def _generate_vehicle_health_history(silver_by_module: dict) -> list:
     ref_list = mod_lists[0]
     rows = []
     for i in range(n):
-        scores = [lst[i]["health_score"] * WEIGHTS.get(mod, 0.2) for mod, lst in silver_by_module.items() if i < len(lst)]
-        fused = sum(scores) if scores else 0
+        mod_scores: dict = {}
+        fused = 0.0
+        for mod, lst in silver_by_module.items():
+            if i < len(lst):
+                h = lst[i]["health_score"]
+                mod_scores[mod] = h
+                fused += h * WEIGHTS.get(mod, 0.2)
         ts = ref_list[i]["timestamp"]
-        rows.append({
+        row: dict = {
             "ts": ts[5:16],
             "timestamp": ts,
             "mileage": ref_list[i]["mileage"],
             "health": round(fused, 2),
-        })
+        }
+        for mod, h in mod_scores.items():
+            row[f"{mod}_contrib"] = round(h, 2)
+        rows.append(row)
     return rows
 
 
@@ -522,31 +530,22 @@ def get_automotive_module_crossfleet(module: str):
 
     bronze_path = os.path.join(_DELTA_ROOT, module)
     if os.path.exists(bronze_path):
-        try:
-            part_dirs = sorted([
-                d for d in os.listdir(bronze_path)
-                if d.startswith("source_id=") and os.path.isdir(os.path.join(bronze_path, d))
-            ])
-        except Exception:
-            part_dirs = []
-        for part_dir in part_dirs:
-            vid = part_dir[len("source_id="):]
-            part_path = os.path.join(bronze_path, part_dir)
-            pfiles = sorted(
-                [os.path.join(r, f) for r, _d, ff in os.walk(part_path) for f in ff if f.endswith(".parquet")],
-                key=os.path.getmtime, reverse=True,
-            )
-            vdfs = []
-            for fp in pfiles[:5]:
-                try:
-                    df = pd.read_parquet(fp)
-                    if not df.empty:
-                        vdfs.append(df)
-                except Exception:
-                    pass
-            if vdfs:
-                grp = pd.concat(vdfs, ignore_index=True)
-                stat: dict = {"vehicle_id": vid}
+        pfiles = sorted(
+            [os.path.join(r, f) for r, _, ff in os.walk(bronze_path) for f in ff if f.endswith(".parquet")],
+            key=os.path.getmtime, reverse=True,
+        )
+        dfs = []
+        for fp in pfiles[:30]:
+            try:
+                df = pd.read_parquet(fp)
+                if not df.empty and "source_id" in df.columns:
+                    dfs.append(df)
+            except Exception:
+                pass
+        if dfs:
+            combined = pd.concat(dfs, ignore_index=True)
+            for vid, grp in combined.groupby("source_id"):
+                stat: dict = {"vehicle_id": str(vid)}
                 for sk in sensor_keys:
                     if sk in grp.columns:
                         stat[f"{sk}_avg"] = round(float(grp[sk].mean()), 3)
@@ -676,8 +675,8 @@ def get_module_fleet_ranking(module: str):
                     pass
             if adfs:
                 adf = pd.concat(adfs, ignore_index=True)
-                if "source_id" in adf.columns and "module" in adf.columns:
-                    for vid, cnt in adf[adf["module"] == module].groupby("source_id").size().items():
+                if "source_id" in adf.columns:
+                    for vid, cnt in adf.groupby("source_id").size().items():
                         alert_counts[str(vid)] = int(cnt)
         except Exception:
             pass
@@ -782,31 +781,22 @@ def get_module_sensor_stats(module: str):
 
     bronze_path = os.path.join(_DELTA_ROOT, module)
     if os.path.exists(bronze_path):
-        try:
-            part_dirs = [
-                d for d in os.listdir(bronze_path)
-                if d.startswith("source_id=") and os.path.isdir(os.path.join(bronze_path, d))
-            ]
-        except Exception:
-            part_dirs = []
-        for part_dir in sorted(part_dirs):
-            vid = part_dir[len("source_id="):]
-            part_path = os.path.join(bronze_path, part_dir)
-            pfiles = sorted(
-                [os.path.join(r, f) for r, _, ff in os.walk(part_path) for f in ff if f.endswith(".parquet")],
-                key=os.path.getmtime, reverse=True,
-            )
-            vdfs = []
-            for fp in pfiles[:5]:
-                try:
-                    df = pd.read_parquet(fp)
-                    if not df.empty:
-                        vdfs.append(df)
-                except Exception:
-                    pass
-            if vdfs:
-                grp = pd.concat(vdfs, ignore_index=True)
-                stat: dict = {"vehicle_id": vid}
+        pfiles = sorted(
+            [os.path.join(r, f) for r, _, ff in os.walk(bronze_path) for f in ff if f.endswith(".parquet")],
+            key=os.path.getmtime, reverse=True,
+        )
+        dfs = []
+        for fp in pfiles[:30]:
+            try:
+                df = pd.read_parquet(fp)
+                if not df.empty and "source_id" in df.columns:
+                    dfs.append(df)
+            except Exception:
+                pass
+        if dfs:
+            combined = pd.concat(dfs, ignore_index=True)
+            for vid, grp in combined.groupby("source_id"):
+                stat: dict = {"vehicle_id": str(vid)}
                 for sk in sensor_keys:
                     if sk in grp.columns:
                         vals = grp[sk].dropna().values.astype(float)
@@ -850,37 +840,30 @@ def get_module_sensor_fleet_history(module: str, sensor: str):
     vehicle_pts: dict = {}
     bronze_path = os.path.join(_DELTA_ROOT, module)
     if os.path.exists(bronze_path):
-        try:
-            part_dirs = [
-                d for d in os.listdir(bronze_path)
-                if d.startswith("source_id=") and os.path.isdir(os.path.join(bronze_path, d))
-            ]
-        except Exception:
-            part_dirs = []
-        for part_dir in sorted(part_dirs):
-            vid = part_dir[len("source_id="):]
-            part_path = os.path.join(bronze_path, part_dir)
-            pfiles = sorted(
-                [os.path.join(r, f) for r, _, ff in os.walk(part_path) for f in ff if f.endswith(".parquet")],
-                key=os.path.getmtime, reverse=True,
-            )
-            vdfs = []
-            for fp in pfiles[:5]:
-                try:
-                    df = pd.read_parquet(fp)
-                    if not df.empty and sensor in df.columns:
-                        ts_col = next((c for c in ("timestamp", "ingest_ts") if c in df.columns), None)
-                        if ts_col:
-                            df["_ts"] = pd.to_datetime(df[ts_col], errors="coerce")
-                            vdfs.append(df[["_ts", sensor]].dropna())
-                except Exception:
-                    pass
-            if vdfs:
-                grp = pd.concat(vdfs, ignore_index=True).sort_values("_ts")
+        pfiles = sorted(
+            [os.path.join(r, f) for r, _, ff in os.walk(bronze_path) for f in ff if f.endswith(".parquet")],
+            key=os.path.getmtime, reverse=True,
+        )
+        dfs = []
+        for fp in pfiles[:30]:
+            try:
+                df = pd.read_parquet(fp)
+                if not df.empty and "source_id" in df.columns and sensor in df.columns:
+                    ts_col = next((c for c in ("timestamp", "ingest_ts") if c in df.columns), None)
+                    if ts_col:
+                        df["_ts"] = pd.to_datetime(df[ts_col], errors="coerce")
+                        dfs.append(df[["source_id", "_ts", sensor]].dropna())
+            except Exception:
+                pass
+        if dfs:
+            combined = pd.concat(dfs, ignore_index=True)
+            for vid, grp in combined.groupby("source_id"):
+                grp = grp.sort_values("_ts")
                 factor = max(1, len(grp) // 200)
                 grp = grp.iloc[::factor]
+                grp = grp.copy()
                 grp["ts"] = grp["_ts"].dt.strftime("%Y-%m-%d %H:%M")
-                vehicle_pts[vid] = [{"ts": r["ts"], "v": round(float(r[sensor]), 3)} for _, r in grp.iterrows()]
+                vehicle_pts[str(vid)] = [{"ts": r["ts"], "v": round(float(r[sensor]), 3)} for _, r in grp.iterrows()]
 
     if not vehicle_pts and _PRESENTATION_MODE_ACTIVE and _DEMO_SEED_CACHE:
         for vid in _DEMO_VEHICLES:

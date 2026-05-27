@@ -1,8 +1,8 @@
-import React, { useMemo, useState, useEffect } from 'react';
+import React, { useMemo, useState, useEffect, useRef } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import {
   Box, Typography, Paper, Chip, Select, MenuItem, FormControl, InputLabel,
-  ToggleButton, ToggleButtonGroup, Button, TextField, CircularProgress, Tabs, Tab,
+  ToggleButton, ToggleButtonGroup, Button, TextField, CircularProgress, Tabs, Tab, LinearProgress,
 } from '@mui/material';
 import PlayArrowIcon from '@mui/icons-material/PlayArrow';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
@@ -15,6 +15,8 @@ import { BarChart, Bar, Cell, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveCo
 
 const API = 'http://127.0.0.1:8005';
 const ALL_MODULES = ['engine', 'transmission', 'battery', 'body', 'tyre'];
+const BATCH_CAP = 15;
+
 const MODULE_COLORS: Record<string, string> = {
   engine: '#e57373', transmission: '#ffb74d', battery: '#81c784',
   body: '#ba68c8', tyre: '#4dd0e1',
@@ -42,6 +44,31 @@ const PLOT_LAYOUT_OVERRIDES = {
   legend: { orientation: 'h' as const, y: -0.3, font: { size: 9 } },
 };
 
+function deduplicateAlerts(alerts: any[]): any[] {
+  const map = new Map<string, any>();
+  for (const alert of alerts) {
+    const key = `${alert.source_id}|${alert.module}`;
+    const existing = map.get(key);
+    if (!existing || new Date(alert.peak_anomaly_ts) > new Date(existing.peak_anomaly_ts)) {
+      map.set(key, alert);
+    }
+  }
+  return Array.from(map.values());
+}
+
+interface BatchProgress {
+  current: number;
+  total: number;
+  currentLabel: string;
+  leftAfterCap: number;
+}
+
+interface BatchResult {
+  analyzed: number;
+  failed: number;
+  leftAfterCap: number;
+}
+
 export default function DtcInvestigation() {
   const { autoRefresh } = useStore();
   const [searchParams] = useSearchParams();
@@ -61,11 +88,25 @@ export default function DtcInvestigation() {
   const [selectedDtcCode, setSelectedDtcCode] = useState<string>('');
   const [loadEvidence,    setLoadEvidence]    = useState<boolean>(!!initPeakTs && !!initVehicle);
 
+  const [batchRunning,  setBatchRunning]  = useState<boolean>(false);
+  const [batchProgress, setBatchProgress] = useState<BatchProgress | null>(null);
+  const [batchResult,   setBatchResult]   = useState<BatchResult | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => { return () => { abortRef.current?.abort(); }; }, []);
+
   const sensorKeys = MODULE_SENSOR_KEYS[selectedModule] || [];
 
   useEffect(() => {
     if (sensorKeys.length > 0 && !selectedSensor) setSelectedSensor(sensorKeys[0]);
   }, [selectedModule]);
+
+  const alertsMetricsQuery = useQuery({
+    queryKey: ['alertsMetricsForDtc'],
+    queryFn: () => axios.get(`${API}/api/alerts/metrics`).then((r) => r.data),
+    refetchInterval: 30000,
+    staleTime: 15000,
+  });
 
   const fleetQuery = useQuery({
     queryKey: ['dtcFleetSummary'],
@@ -90,12 +131,14 @@ export default function DtcInvestigation() {
     queryKey: ['dtcFleetDistribution'],
     queryFn: () => axios.get(`${API}/api/automotive/dtc/fleet-distribution`).then((r) => r.data),
     staleTime: 30000,
+    refetchInterval: 10 * 60 * 1000,
   });
 
   const allHistoryQuery = useQuery({
     queryKey: ['dtcAllHistory'],
     queryFn: () => axios.get(`${API}/api/automotive/dtc/history`).then((r) => r.data),
     staleTime: 30000,
+    refetchInterval: 10 * 60 * 1000,
   });
 
   const dtcAnalysisQuery = useQuery({
@@ -164,6 +207,49 @@ export default function DtcInvestigation() {
     [fleetDistributionQuery.data],
   );
 
+  const analyzedKeys = useMemo((): Set<string> => {
+    const keys = new Set<string>();
+    (allHistoryQuery.data?.runs || []).forEach((r: any) => {
+      keys.add(`${r.source_id}|${r.module}|${r.peak_ts}`);
+    });
+    return keys;
+  }, [allHistoryQuery.data]);
+
+  const alertCoverage = useMemo(() => {
+    const active: any[] = alertsMetricsQuery.data?.open_alerts || [];
+    const deduped = deduplicateAlerts(active);
+    const analyzed = deduped.filter((a) =>
+      analyzedKeys.has(`${a.source_id}|${a.module}|${a.peak_anomaly_ts}`),
+    ).length;
+    return { analyzed, total: deduped.length, remaining: deduped.length - analyzed };
+  }, [alertsMetricsQuery.data, analyzedKeys]);
+
+  const perVehicleSummary = useMemo(() => {
+    const runs: any[] = allHistoryQuery.data?.runs || [];
+    const map = new Map<string, {
+      runCount: number;
+      codes: Map<string, { count: number; severity: string }>;
+      lastRunTs: string;
+    }>();
+    runs.forEach((r: any) => {
+      if (!map.has(r.source_id)) map.set(r.source_id, { runCount: 0, codes: new Map(), lastRunTs: '' });
+      const v = map.get(r.source_id)!;
+      v.runCount++;
+      if ((r.run_ts || '') > v.lastRunTs) v.lastRunTs = r.run_ts || '';
+      (r.triggers || []).forEach((t: any) => {
+        const c = v.codes.get(t.code);
+        if (c) { c.count++; } else { v.codes.set(t.code, { count: 1, severity: t.severity || '' }); }
+      });
+    });
+    return Array.from(map.entries()).map(([vehicle_id, v]) => {
+      let topCode = '—'; let topSev = ''; let topCnt = 0;
+      v.codes.forEach((val, code) => {
+        if (val.count > topCnt) { topCnt = val.count; topCode = code; topSev = val.severity; }
+      });
+      return { vehicle_id, runCount: v.runCount, uniqueCodes: v.codes.size, topCode, topSev, topCnt, lastRunTs: v.lastRunTs };
+    }).sort((a, b) => b.runCount - a.runCount);
+  }, [allHistoryQuery.data]);
+
   const fleetKpis = useMemo(() => {
     const runs: any[] = allHistoryQuery.data?.runs || [];
     const allCodes = new Set<string>();
@@ -174,8 +260,7 @@ export default function DtcInvestigation() {
         if (t.severity === 'critical' || t.severity === 'CRITICAL') criticalCount++;
       });
     });
-    const topCode = distributionData[0]?.code || '—';
-    return { totalRuns: runs.length, uniqueFaults: allCodes.size, criticalCount, topCode };
+    return { totalRuns: runs.length, uniqueFaults: allCodes.size, criticalCount, topCode: distributionData[0]?.code || '—' };
   }, [allHistoryQuery.data, distributionData]);
 
   const evidenceData: any[] = sensorEvidenceQuery.data?.data || [];
@@ -190,7 +275,6 @@ export default function DtcInvestigation() {
   const analysisTriggered    = (analysisData?.triggers  || []) as any[];
   const criticalPlot: any    = analysisData?.critical_plot    ?? null;
   const nonCriticalPlot: any = analysisData?.non_critical_plot ?? null;
-
   const canRun = !!selectedVehicle && !!selectedModule && !!peakTs;
 
   const navigateToDeepDive = (vehicle: string, module: string, peak_ts: string, dtcCode?: string) => {
@@ -199,6 +283,58 @@ export default function DtcInvestigation() {
     setPeakTs(peak_ts);
     if (dtcCode) setSelectedDtcCode(dtcCode);
     setActiveTab(1);
+  };
+
+  const handleLoadLatest = async () => {
+    if (batchRunning) return;
+    const active: any[] = alertsMetricsQuery.data?.open_alerts || [];
+    const deduped = deduplicateAlerts(active);
+    const toAnalyze = deduped
+      .filter((a) => !analyzedKeys.has(`${a.source_id}|${a.module}|${a.peak_anomaly_ts}`))
+      .sort((a, b) => (b.max_composite_score || 0) - (a.max_composite_score || 0));
+
+    const queued = toAnalyze.slice(0, BATCH_CAP);
+    const leftAfterCap = toAnalyze.length - queued.length;
+
+    if (queued.length === 0) {
+      setBatchResult({ analyzed: 0, failed: 0, leftAfterCap: 0 });
+      return;
+    }
+
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setBatchRunning(true);
+    setBatchResult(null);
+
+    let analyzed = 0;
+    let failed = 0;
+
+    for (let i = 0; i < queued.length; i++) {
+      if (controller.signal.aborted) break;
+      const alert = queued[i];
+      setBatchProgress({
+        current: i + 1,
+        total: queued.length,
+        currentLabel: `${alert.source_id} / ${alert.module.toUpperCase()}`,
+        leftAfterCap,
+      });
+      try {
+        await axios.get(`${API}/api/dtc/analyze`, {
+          params: { source_id: alert.source_id, module: alert.module, peak_ts: alert.peak_anomaly_ts },
+          timeout: 70000,
+          signal: controller.signal,
+        });
+        analyzed++;
+      } catch (_err: unknown) {
+        if (!controller.signal.aborted) failed++;
+      }
+      queryClient.invalidateQueries({ queryKey: ['dtcFleetDistribution'] });
+      queryClient.invalidateQueries({ queryKey: ['dtcAllHistory'] });
+    }
+
+    setBatchRunning(false);
+    setBatchProgress(null);
+    setBatchResult({ analyzed, failed, leftAfterCap });
   };
 
   const evidenceOption = useMemo((): EChartsOption => {
@@ -235,7 +371,7 @@ export default function DtcInvestigation() {
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2, p: 2, bgcolor: '#f5f5f5' }}>
 
-      {/* HEADER */}
+      {/* HEADER + TABS */}
       <Box sx={{ borderBottom: '2px solid #bdbdbd', pb: 1, display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end', flexWrap: 'wrap', gap: 1 }}>
         <Box>
           <Typography variant="h5" sx={{ fontWeight: 700, color: '#212121', letterSpacing: '-0.5px' }}>
@@ -261,16 +397,109 @@ export default function DtcInvestigation() {
         </Tabs>
       </Box>
 
-      {/* TAB 0: FLEET OVERVIEW */}
+      {/* ── TAB 0: FLEET OVERVIEW ── */}
       {activeTab === 0 && (
         <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
 
+          {/* Fleet header: coverage + Load Latest */}
+          <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 1 }}>
+            <Box sx={{ display: 'flex', gap: 1, alignItems: 'center', flexWrap: 'wrap' }}>
+              <Chip
+                size="small"
+                label={
+                  alertsMetricsQuery.isLoading
+                    ? 'Loading alerts...'
+                    : `${alertCoverage.analyzed} / ${alertCoverage.total} active alerts analyzed`
+                }
+                sx={{
+                  borderRadius: 0, fontFamily: 'monospace', fontWeight: 'bold', fontSize: '10px', height: 22,
+                  bgcolor: alertCoverage.remaining === 0 && alertCoverage.total > 0 ? '#e8f5e9' : '#fff8e1',
+                  color: alertCoverage.remaining === 0 && alertCoverage.total > 0 ? '#2e7d32' : '#f57c00',
+                  border: `1px solid ${alertCoverage.remaining === 0 && alertCoverage.total > 0 ? '#a5d6a7' : '#ffcc02'}`,
+                }}
+              />
+              {alertCoverage.remaining > 0 && !batchRunning && (
+                <Chip
+                  size="small"
+                  label={`${alertCoverage.remaining} unanalyzed`}
+                  sx={{ borderRadius: 0, fontFamily: 'monospace', fontWeight: 'bold', fontSize: '10px', height: 22, bgcolor: '#ffebee', color: '#d32f2f', border: '1px solid #ef9a9a' }}
+                />
+              )}
+            </Box>
+            <Box sx={{ display: 'flex', gap: 1 }}>
+              {batchRunning && (
+                <Button
+                  variant="outlined"
+                  size="small"
+                  color="error"
+                  onClick={() => abortRef.current?.abort()}
+                  sx={{ borderRadius: 0, fontWeight: 'bold', fontSize: '11px', minWidth: 80 }}
+                >
+                  STOP
+                </Button>
+              )}
+              <Button
+                variant="contained"
+                size="small"
+                startIcon={batchRunning ? <CircularProgress size={12} color="inherit" /> : <PlayArrowIcon />}
+                disabled={batchRunning || alertsMetricsQuery.isLoading}
+                onClick={handleLoadLatest}
+                sx={{ borderRadius: 0, boxShadow: 'none', fontWeight: 'bold', fontSize: '11px', bgcolor: '#1565c0', '&:hover': { bgcolor: '#0d47a1' }, minWidth: 140 }}
+              >
+                {batchRunning ? 'ANALYZING...' : 'LOAD LATEST'}
+              </Button>
+            </Box>
+          </Box>
+
+          {/* Batch progress bar */}
+          {batchRunning && batchProgress && (
+            <Paper sx={{ p: 1.5, borderRadius: 0, bgcolor: '#e3f2fd', border: '1px solid #90caf9' }}>
+              <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 0.5 }}>
+                <Typography variant="caption" sx={{ fontFamily: 'monospace', fontWeight: 'bold', color: '#1565c0' }}>
+                  ANALYZING {batchProgress.current} / {batchProgress.total}: {batchProgress.currentLabel}
+                </Typography>
+                {batchProgress.leftAfterCap > 0 && (
+                  <Typography variant="caption" sx={{ fontFamily: 'monospace', color: '#f57c00', fontSize: '10px' }}>
+                    +{batchProgress.leftAfterCap} more queued after this batch (cap {BATCH_CAP}/run)
+                  </Typography>
+                )}
+              </Box>
+              <LinearProgress
+                variant="determinate"
+                value={(batchProgress.current / batchProgress.total) * 100}
+                sx={{ height: 6, borderRadius: 0, bgcolor: '#bbdefb', '& .MuiLinearProgress-bar': { bgcolor: '#1565c0' } }}
+              />
+            </Paper>
+          )}
+
+          {/* Batch result message */}
+          {!batchRunning && batchResult !== null && (
+            <Paper sx={{
+              p: 1.5, borderRadius: 0,
+              bgcolor: batchResult.analyzed === 0 && batchResult.leftAfterCap === 0 ? '#e8f5e9' : batchResult.leftAfterCap > 0 ? '#fff8e1' : '#e8f5e9',
+              border: `1px solid ${batchResult.leftAfterCap > 0 ? '#ffcc02' : '#a5d6a7'}`,
+            }}>
+              <Typography variant="caption" sx={{ fontFamily: 'monospace', color: '#424242' }}>
+                {batchResult.analyzed === 0 && batchResult.leftAfterCap === 0
+                  ? 'All active alerts already analyzed — fleet overview is up to date.'
+                  : `${batchResult.analyzed} new alert${batchResult.analyzed !== 1 ? 's' : ''} analyzed.`}
+                {batchResult.failed > 0 && ` ${batchResult.failed} failed (service error).`}
+                {batchResult.leftAfterCap > 0 && (
+                  <span style={{ color: '#f57c00', fontWeight: 'bold' }}>
+                    {` ${batchResult.leftAfterCap} alert${batchResult.leftAfterCap !== 1 ? 's' : ''} not processed this run (cap ${BATCH_CAP}/run) — click LOAD LATEST again to continue.`}
+                  </span>
+                )}
+              </Typography>
+            </Paper>
+          )}
+
+          {/* KPI Cards */}
           <Box sx={{ display: 'flex', gap: 2 }}>
             {([
-              { label: 'TOTAL ANALYSIS RUNS',     value: fleetKpis.totalRuns,    color: '#1976d2' },
-              { label: 'UNIQUE FAULT CODES SEEN',  value: fleetKpis.uniqueFaults, color: '#7b1fa2' },
+              { label: 'TOTAL ANALYSIS RUNS',     value: fleetKpis.totalRuns,     color: '#1976d2' },
+              { label: 'UNIQUE FAULT CODES SEEN',  value: fleetKpis.uniqueFaults,  color: '#7b1fa2' },
               { label: 'CRITICAL FAULT TRIGGERS',  value: fleetKpis.criticalCount, color: '#d32f2f' },
-              { label: 'TOP TRIGGERED CODE',       value: fleetKpis.topCode,      color: '#f57c00' },
+              { label: 'TOP TRIGGERED CODE',       value: fleetKpis.topCode,       color: '#f57c00' },
             ] as { label: string; value: string | number; color: string }[]).map((kpi, i) => (
               <Paper key={i} sx={{ flex: 1, p: 2, borderRadius: 0, borderLeft: `4px solid ${kpi.color}` }}>
                 <Typography variant="caption" sx={{ color: '#757575', fontWeight: 'bold', display: 'block' }}>{kpi.label}</Typography>
@@ -279,10 +508,72 @@ export default function DtcInvestigation() {
             ))}
           </Box>
 
-          <Box sx={{ display: 'flex', gap: 2, height: 440 }}>
+          {/* Per-vehicle DTC summary */}
+          <Paper sx={{ p: 1.5, borderRadius: 0 }}>
+            <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 0.5 }}>
+              <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161' }}>
+                PER-VEHICLE DTC SUMMARY
+              </Typography>
+              <Typography variant="caption" sx={{ color: '#9e9e9e', fontFamily: 'monospace', fontSize: '10px' }}>
+                click row to investigate in Deep Dive
+              </Typography>
+            </Box>
+            <Box sx={{ maxHeight: 200, overflowY: 'auto', border: '1px solid #e0e0e0' }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontFamily: 'monospace', fontSize: '11px' }}>
+                <thead>
+                  <tr style={{ borderBottom: '2px solid #bdbdbd' }}>
+                    {['VEHICLE', 'ANALYSES RUN', 'UNIQUE CODES', 'MOST PREVALENT', 'SEVERITY', 'LAST RUN'].map((h) => (
+                      <th key={h} style={{ textAlign: 'left', padding: '4px 12px', color: '#616161', fontWeight: 700, position: 'sticky', top: 0, background: 'white', boxShadow: '0 1px 0 #bdbdbd', whiteSpace: 'nowrap' }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {perVehicleSummary.length > 0 ? perVehicleSummary.map((row, i) => (
+                    <tr
+                      key={row.vehicle_id}
+                      onClick={() => navigateToDeepDive(row.vehicle_id, selectedModule, '')}
+                      style={{ borderBottom: '1px solid #f0f0f0', background: i % 2 === 0 ? '#fafafa' : 'white', cursor: 'pointer' }}
+                      title="Click to open Deep Dive for this vehicle"
+                    >
+                      <td style={{ padding: '5px 12px', fontWeight: 700 }}>{row.vehicle_id}</td>
+                      <td style={{ padding: '5px 12px', color: '#1976d2', fontWeight: 600 }}>{row.runCount}</td>
+                      <td style={{ padding: '5px 12px' }}>{row.uniqueCodes}</td>
+                      <td style={{ padding: '5px 12px' }}>
+                        {row.topCode === '—' ? (
+                          <span style={{ color: '#2e7d32', fontWeight: 600 }}>CLEAN</span>
+                        ) : (
+                          <span style={{
+                            display: 'inline-block', padding: '1px 7px', fontSize: '10px', fontWeight: 700,
+                            background: sevColor(row.topSev) === '#d32f2f' ? '#d32f2f' : '#ed6c02', color: 'white',
+                          }}>
+                            {row.topCode} ×{row.topCnt}
+                          </span>
+                        )}
+                      </td>
+                      <td style={{ padding: '5px 12px' }}>
+                        {row.topSev ? (
+                          <span style={{ fontWeight: 700, color: sevColor(row.topSev), textTransform: 'uppercase' }}>{row.topSev}</span>
+                        ) : '—'}
+                      </td>
+                      <td style={{ padding: '5px 12px', color: '#9e9e9e' }}>{row.lastRunTs.slice(0, 16) || '—'}</td>
+                    </tr>
+                  )) : (
+                    <tr>
+                      <td colSpan={6} style={{ padding: '12px', color: '#9e9e9e', textAlign: 'center' }}>
+                        {allHistoryQuery.isLoading ? 'Loading…' : 'No analyses yet — click LOAD LATEST to analyze active alerts'}
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </Box>
+          </Paper>
+
+          {/* Fault frequency chart + run log */}
+          <Box sx={{ display: 'flex', gap: 2, height: 400 }}>
             <Paper sx={{ flex: 1, p: 1.5, borderRadius: 0, display: 'flex', flexDirection: 'column' }}>
               <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161', mb: 0.5 }}>
-                HISTORICAL FAULT FREQUENCY — most triggered codes across all analysis runs
+                HISTORICAL FAULT FREQUENCY — most triggered codes across all runs
               </Typography>
               <Box sx={{ flex: 1, minHeight: 0 }}>
                 {distributionData.length > 0 ? (
@@ -313,7 +604,7 @@ export default function DtcInvestigation() {
                   <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', flexDirection: 'column', gap: 1 }}>
                     <Typography variant="caption" sx={{ color: '#9e9e9e' }}>No data yet</Typography>
                     <Typography variant="caption" sx={{ color: '#bdbdbd', fontSize: '10px', textAlign: 'center' }}>
-                      Populated each time DTC analysis is triggered in the Deep Dive tab
+                      Click LOAD LATEST to run analysis on active alerts
                     </Typography>
                   </Box>
                 )}
@@ -370,7 +661,7 @@ export default function DtcInvestigation() {
                     {!(allHistoryQuery.data?.runs?.length) && (
                       <tr>
                         <td colSpan={4} style={{ padding: '10px', color: '#9e9e9e', textAlign: 'center' }}>
-                          {allHistoryQuery.isLoading ? 'Loading…' : 'No analysis runs yet — go to Deep Dive and run DTC analysis'}
+                          {allHistoryQuery.isLoading ? 'Loading…' : 'No runs yet — click LOAD LATEST to analyze active alerts'}
                         </td>
                       </tr>
                     )}
@@ -382,7 +673,7 @@ export default function DtcInvestigation() {
         </Box>
       )}
 
-      {/* TAB 1: DEEP DIVE */}
+      {/* ── TAB 1: DEEP DIVE ── */}
       {activeTab === 1 && (
         <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
 
@@ -662,7 +953,7 @@ export default function DtcInvestigation() {
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, mb: 1, flexWrap: 'wrap' }}>
               <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161' }}>
                 SENSOR EVIDENCE — {selectedVehicle} / {selectedModule.toUpperCase()}
-                {peakTs && <span style={{ color: '#d32f2f', marginLeft: 6 }}>▲ PEAK {peakTs.slice(0, 16)}</span>}
+                {peakTs && <span style={{ color: '#d32f2f', marginLeft: 6 }}>PEAK {peakTs.slice(0, 16)}</span>}
               </Typography>
               <FormControl size="small" sx={{ minWidth: 240 }}>
                 <InputLabel>Sensor</InputLabel>

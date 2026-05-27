@@ -18,7 +18,7 @@ import type { EChartsOption } from 'echarts';
 import TimeRangePicker from '../components/TimeRangePicker';
 import {
   LineChart, Line, BarChart, Bar, AreaChart, Area, XAxis, YAxis, CartesianGrid,
-  Tooltip, Legend, ResponsiveContainer, ReferenceLine,
+  Tooltip, Legend, ResponsiveContainer, ReferenceLine, Brush,
   RadarChart, Radar, PolarGrid, PolarAngleAxis, PolarRadiusAxis,
   PieChart, Pie, Cell,
 } from 'recharts';
@@ -189,7 +189,7 @@ function SensorChart({
       </Typography>
       <Box sx={{ flex: 1 }}>
         <ResponsiveContainer width="100%" height="100%">
-          <LineChart data={data} margin={{ top: 4, right: 8, left: -28, bottom: 0 }}>
+          <LineChart data={data} margin={{ top: 4, right: 8, left: -28, bottom: 20 }}>
             <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#eeeeee" />
             <XAxis
               dataKey={xKey}
@@ -205,6 +205,7 @@ function SensorChart({
             {group.sensors.map((s) => (
               <Line key={s.key} type="monotone" dataKey={s.key} name={s.label} stroke={s.color} strokeWidth={1.5} dot={false} isAnimationActive={false} />
             ))}
+            <Brush dataKey={xKey} height={18} stroke="#bdbdbd" travellerWidth={6} />
           </LineChart>
         </ResponsiveContainer>
       </Box>
@@ -226,6 +227,7 @@ export default function AutomotiveDive() {
   const [selectedModule, setSelectedModule] = useState<string>(ALL_MODULES.includes(_initModule) ? _initModule : 'engine');
   const [analysisModule, setAnalysisModule] = useState<string>('engine');
   const [analysisKey, setAnalysisKey] = useState<string>('');
+  const [distributionKey, setDistributionKey] = useState<string>('');
   const [analysisTimeRange, setAnalysisTimeRange] = useState<number>(168);
   const [dtcResult, setDtcResult] = useState<any>(null);
   const [dtcRunning, setDtcRunning] = useState(false);
@@ -340,6 +342,7 @@ export default function AutomotiveDive() {
   useEffect(() => {
     const keys = crossfleetQuery.data?.sensor_keys;
     if (keys?.length > 0 && !analysisKey) setAnalysisKey(keys[0]);
+    if (keys?.length > 0 && !distributionKey) setDistributionKey(keys[0]);
   }, [crossfleetQuery.data]);
 
   const vehicles: any[] = fleetQuery.data?.vehicles || [];
@@ -447,7 +450,7 @@ export default function AutomotiveDive() {
     [moduleRankings],
   );
 
-  const fleetHealthTrendOption: EChartsOption = useMemo(() => {
+  const fleetHealthTrendOption = useMemo((): EChartsOption => {
     const allVids: string[] = moduleFleetHealthQuery.data?.vehicles || [];
     const rawSeries: any[] = moduleFleetHealthQuery.data?.series || [];
     const cutoff = analysisTimeRange < 8760
@@ -455,6 +458,8 @@ export default function AutomotiveDive() {
       : null;
     const series = cutoff ? rawSeries.filter((r: any) => new Date(r.ts) >= cutoff) : rawSeries;
     const VID_COLORS = ['#e57373', '#ffb74d', '#81c784', '#ba68c8', '#4dd0e1', '#42a5f5', '#ff8a65'];
+
+    const selectedDefault = Object.fromEntries(allVids.map((vid: string) => [vid, false]));
 
     return {
       tooltip: {
@@ -464,23 +469,32 @@ export default function AutomotiveDive() {
         borderWidth: 1,
         padding: [8, 12],
         textStyle: { fontFamily: 'monospace', fontSize: 11 },
-        axisPointer: { type: 'cross', label: { backgroundColor: '#424242' } },
+        axisPointer: { type: 'line', lineStyle: { color: '#bdbdbd', type: 'dashed' } },
+        formatter: (params: any) => {
+          const sorted = [...params].sort((a: any, b: any) => (b.value ?? 0) - (a.value ?? 0));
+          return sorted.map((p: any) => `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${p.color};margin-right:4px"></span>${p.seriesName}: <b>${p.value ?? '—'}%</b>`).join('<br/>');
+        },
       },
       legend: {
-        data: [...allVids, 'fleet_avg'],
+        data: [...allVids.map((vid: string) => ({ name: vid })), { name: 'FLEET AVG' }],
+        selected: { ...selectedDefault, 'FLEET AVG': true },
         textStyle: { fontFamily: 'monospace', fontSize: 10 },
-        itemHeight: 10,
-        bottom: 28,
+        itemHeight: 8,
+        top: 4,
+        right: 8,
+        type: 'scroll' as const,
+        orient: 'horizontal' as const,
+        icon: 'circle',
       },
       dataZoom: [
         { type: 'inside', xAxisIndex: 0 },
-        { type: 'slider', xAxisIndex: 0, bottom: 4, height: 18 },
+        { type: 'slider', xAxisIndex: 0, bottom: 2, height: 20, borderColor: '#e0e0e0', fillerColor: 'rgba(25,118,210,0.08)', handleStyle: { color: '#1976d2' } },
       ],
-      grid: { top: 36, right: 16, bottom: 72, left: 50 },
+      grid: { top: 44, right: 16, bottom: 48, left: 52 },
       xAxis: {
         type: 'category',
         data: series.map((r: any) => r.ts),
-        axisLabel: { fontFamily: 'monospace', fontSize: 10, color: '#616161', rotate: 0 },
+        axisLabel: { fontFamily: 'monospace', fontSize: 10, color: '#616161' },
         axisLine: { lineStyle: { color: '#bdbdbd' } },
         axisTick: { show: false },
         splitLine: { show: false },
@@ -500,25 +514,27 @@ export default function AutomotiveDive() {
           type: 'line' as const,
           data: series.map((r: any) => r[vid] ?? null),
           symbol: 'none',
-          lineStyle: { color: VID_COLORS[i % VID_COLORS.length], width: 1.5 },
+          lineStyle: { color: VID_COLORS[i % VID_COLORS.length], width: 1.2, opacity: 0.55 },
           itemStyle: { color: VID_COLORS[i % VID_COLORS.length] },
           smooth: false,
           connectNulls: false,
+          emphasis: { lineStyle: { width: 2, opacity: 1 } },
         })),
         {
-          name: 'fleet_avg',
+          name: 'FLEET AVG',
           type: 'line' as const,
           data: series.map((r: any) => r.fleet_avg ?? null),
           symbol: 'none',
-          lineStyle: { color: '#1976d2', width: 3, type: 'dashed' },
+          lineStyle: { color: '#1976d2', width: 2.5 },
           itemStyle: { color: '#1976d2' },
           smooth: false,
+          z: 10,
           markLine: {
             silent: true,
             symbol: 'none',
             data: [
-              { yAxis: 60, lineStyle: { color: '#d32f2f', type: 'dashed', width: 1 }, label: { formatter: 'CRITICAL', fontSize: 9, color: '#d32f2f', fontFamily: 'monospace' } },
-              { yAxis: 80, lineStyle: { color: '#ed6c02', type: 'dashed', width: 1 }, label: { formatter: 'WARNING', fontSize: 9, color: '#ed6c02', fontFamily: 'monospace' } },
+              { yAxis: 60, lineStyle: { color: '#d32f2f', type: 'dashed', width: 1 }, label: { formatter: 'CRITICAL', fontSize: 9, color: '#d32f2f', fontFamily: 'monospace', position: 'insideStartTop' } },
+              { yAxis: 80, lineStyle: { color: '#ed6c02', type: 'dashed', width: 1 }, label: { formatter: 'WARNING', fontSize: 9, color: '#ed6c02', fontFamily: 'monospace', position: 'insideStartTop' } },
             ],
           },
           markArea: {
@@ -530,12 +546,12 @@ export default function AutomotiveDive() {
           },
         },
       ],
-    };
+    } as EChartsOption;
   }, [moduleFleetHealthQuery.data, analysisTimeRange]);
 
   const sensorBoxData = useMemo(() => {
     const vehicles: any[] = moduleSensorStatsQuery.data?.vehicles || [];
-    const sk = currentAnalysisKey;
+    const sk = distributionKey || currentAnalysisKey;
     return vehicles.map((v: any) => ({
       vehicle_id: v.vehicle_id,
       min: v[`${sk}_min`] ?? 0,
@@ -597,7 +613,7 @@ export default function AutomotiveDive() {
       },
     },
     {
-      field: 'alert_count', headerName: 'ALERTS', width: 90, sortable: true,
+      field: 'alert_count', headerName: 'TOTAL ALERTS', width: 110, sortable: true,
       cellStyle: (params: any) => ({ fontWeight: 'bold', color: params.value > 0 ? '#d32f2f' : '#388e3c' }),
     },
     { field: 'total_pts', headerName: 'DATA PTS', width: 100, sortable: true },
@@ -617,6 +633,7 @@ export default function AutomotiveDive() {
         timeout: 60000,
       });
       setDtcResult(res.data);
+      if (res.data?.success) dtcHistoryQuery.refetch();
     } catch {
       setDtcResult({ error: 'DTC service offline or unreachable (port 8007). Start dtc_service/api.py to enable analysis.' });
     } finally {
@@ -656,7 +673,7 @@ export default function AutomotiveDive() {
     const data: any[] = sampled.map((r: any) => {
       const fm: Record<string, number> = {};
       parseTopFeatures(r.top_features || '').forEach((f) => { fm[f.feature] = f.score; });
-      const row: Record<string, any> = { ts: String(r.timestamp || '').slice(5, 16), mileage: r.mileage ?? 0 };
+      const row: Record<string, any> = { timestamp: String(r.timestamp || '').slice(5, 16), mileage: r.mileage ?? 0 };
       series.forEach((s) => { row[s] = fm[s] ?? 0; });
       return row;
     });
@@ -833,7 +850,7 @@ export default function AutomotiveDive() {
               </Box>
               <Box sx={{ flex: 1 }}>
                 <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={healthHistory} margin={{ top: 4, right: 15, left: -25, bottom: 0 }}>
+                  <LineChart data={healthHistory} margin={{ top: 4, right: 15, left: -25, bottom: 20 }}>
                     <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#eeeeee" />
                     <XAxis dataKey={xAxisMode === 'mileage' ? 'mileage' : 'ts'} tick={axisStyle} axisLine={{ stroke: '#bdbdbd' }} tickLine={false} minTickGap={40} tickFormatter={(v) => formatXTick(v, xAxisMode)} />
                     <YAxis domain={[0, 100]} tick={axisStyle} axisLine={{ stroke: '#bdbdbd' }} tickLine={false} />
@@ -841,6 +858,7 @@ export default function AutomotiveDive() {
                     <ReferenceLine y={60} stroke="#d32f2f" strokeDasharray="4 4" />
                     <ReferenceLine y={80} stroke="#ed6c02" strokeDasharray="4 4" />
                     <Line type="monotone" dataKey="health" name="Health %" stroke="#1976d2" strokeWidth={2} dot={false} isAnimationActive={false} />
+                    <Brush dataKey={xAxisMode === 'mileage' ? 'mileage' : 'ts'} height={18} stroke="#bdbdbd" travellerWidth={6} />
                   </LineChart>
                 </ResponsiveContainer>
               </Box>
@@ -858,7 +876,7 @@ export default function AutomotiveDive() {
               </Box>
               <Box sx={{ flex: 1 }}>
                 <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={moduleHealthData} margin={{ top: 4, right: 15, left: -25, bottom: 0 }}>
+                  <LineChart data={moduleHealthData} margin={{ top: 4, right: 15, left: -25, bottom: 20 }}>
                     <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#eeeeee" />
                     <XAxis
                       dataKey={xAxisMode === 'timestamp' ? 'timestamp' : 'mileage'}
@@ -871,6 +889,7 @@ export default function AutomotiveDive() {
                     <ReferenceLine y={80} stroke="#ed6c02" strokeDasharray="4 4" label={{ value: 'WARN', fontSize: 9, fill: '#ed6c02' }} />
                     <Line type="monotone" dataKey="health_score" name="ML Health"
                       stroke={MODULE_COLORS[selectedModule]} strokeWidth={2} dot={false} isAnimationActive={false} />
+                    <Brush dataKey={xAxisMode === 'timestamp' ? 'timestamp' : 'mileage'} height={18} stroke="#bdbdbd" travellerWidth={6} />
                   </LineChart>
                 </ResponsiveContainer>
               </Box>
@@ -944,7 +963,7 @@ export default function AutomotiveDive() {
             <Box sx={{ flex: 1, minHeight: 0 }}>
               {decompositionHistory.length > 0 ? (
                 <ResponsiveContainer width="100%" height="100%">
-                  <AreaChart data={decompositionHistory} margin={{ top: 4, right: 15, left: -25, bottom: 0 }}>
+                  <AreaChart data={decompositionHistory} margin={{ top: 4, right: 15, left: -25, bottom: 20 }}>
                     <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#eeeeee" />
                     <XAxis dataKey={xAxisMode === 'mileage' ? 'mileage' : 'ts'} tick={axisStyle} axisLine={{ stroke: '#bdbdbd' }} tickLine={false} minTickGap={40} tickFormatter={(v) => formatXTick(v, xAxisMode)} />
                     <YAxis domain={[0, 100]} tick={axisStyle} axisLine={{ stroke: '#bdbdbd' }} tickLine={false} />
@@ -953,6 +972,7 @@ export default function AutomotiveDive() {
                     {ALL_MODULES.map((mod) => (
                       <Area key={mod} type="monotone" dataKey={mod} name={mod.toUpperCase()} stroke={MODULE_COLORS[mod]} fill={MODULE_COLORS[mod]} fillOpacity={0.15} strokeWidth={1.5} dot={false} isAnimationActive={false} />
                     ))}
+                    <Brush dataKey={xAxisMode === 'mileage' ? 'mileage' : 'ts'} height={18} stroke="#bdbdbd" travellerWidth={6} />
                   </AreaChart>
                 </ResponsiveContainer>
               ) : (
@@ -1525,10 +1545,27 @@ export default function AutomotiveDive() {
 
           {/* ── SECTION: Sensor distribution stats table (p25/median/p75 per vehicle) ── */}
           <Paper sx={{ p: 1.5, borderRadius: 0 }}>
-            <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161', mb: 1, display: 'block' }}>
-              SENSOR DISTRIBUTION — {currentAnalysisKey.replace(/_/g, ' ').toUpperCase()} PER VEHICLE &nbsp;
-              <span style={{ color: '#9e9e9e', fontWeight: 'normal' }}>(BRONZE · percentile statistics)</span>
-            </Typography>
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, mb: 1 }}>
+              <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161' }}>
+                SENSOR DISTRIBUTION — PER VEHICLE &nbsp;
+                <span style={{ color: '#9e9e9e', fontWeight: 'normal' }}>(BRONZE · percentile statistics)</span>
+              </Typography>
+              {sensorKeys.length > 0 && (
+                <FormControl size="small" sx={{ minWidth: 240 }}>
+                  <Select
+                    value={distributionKey || currentAnalysisKey}
+                    onChange={(e) => setDistributionKey(e.target.value)}
+                    sx={{ borderRadius: 0, fontSize: '11px', fontFamily: 'monospace' }}
+                  >
+                    {sensorKeys.map((k) => (
+                      <MenuItem key={k} value={k} sx={{ fontSize: '11px', fontFamily: 'monospace' }}>
+                        {k.replace(/_/g, ' ').toUpperCase()}
+                      </MenuItem>
+                    ))}
+                  </Select>
+                </FormControl>
+              )}
+            </Box>
             {sensorBoxData.length > 0 ? (
               <Box sx={{ overflowX: 'auto' }}>
                 <table style={{ width: '100%', borderCollapse: 'collapse', fontFamily: 'monospace', fontSize: '11px' }}>
@@ -1576,7 +1613,7 @@ export default function AutomotiveDive() {
             <Box sx={{ flex: 1, minHeight: 0 }}>
               {sensorFleetHistoryData.length > 0 && sensorFleetHistorySeries.length > 0 ? (
                 <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={sensorFleetHistoryData} margin={{ top: 4, right: 16, left: -24, bottom: 0 }}>
+                  <LineChart data={sensorFleetHistoryData} margin={{ top: 4, right: 16, left: -24, bottom: 20 }}>
                     <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#eeeeee" />
                     <XAxis dataKey="ts" tick={axisStyle} axisLine={{ stroke: '#bdbdbd' }} tickLine={false} minTickGap={40} />
                     <YAxis tick={axisStyle} axisLine={{ stroke: '#bdbdbd' }} tickLine={false} />
@@ -1586,6 +1623,7 @@ export default function AutomotiveDive() {
                       <Line key={vid} type="monotone" dataKey={vid} name={vid} stroke={SHAP_COLORS[i % SHAP_COLORS.length]}
                         strokeWidth={1.5} dot={false} isAnimationActive={false} connectNulls={false} />
                     ))}
+                    <Brush dataKey="ts" height={18} stroke="#bdbdbd" travellerWidth={6} />
                   </LineChart>
                 </ResponsiveContainer>
               ) : (
