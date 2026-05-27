@@ -10,7 +10,7 @@ import { useStore } from '../store';
 import EChart from '../components/EChart';
 import type { EChartsOption } from 'echarts';
 import {
-  BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
+  BarChart, Bar, Cell, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
 } from 'recharts';
 
 const API = 'http://127.0.0.1:8005';
@@ -213,7 +213,7 @@ export default function DtcInvestigation() {
   }, [evidenceData, peakTs, peakTsMs, evidenceWindow, selectedModule]);
 
   return (
-    <Box sx={{ height: 'calc(100vh - 80px)', display: 'flex', flexDirection: 'column', gap: 2, p: 2, bgcolor: '#f5f5f5', overflow: 'auto' }}>
+    <Box sx={{ height: 'calc(100vh - 80px)', display: 'flex', flexDirection: 'column', gap: 2, p: 2, bgcolor: '#f5f5f5', overflow: 'hidden' }}>
 
       {/* ── HEADER ── */}
       <Box sx={{ borderBottom: '2px solid #bdbdbd', pb: 1 }}>
@@ -442,10 +442,10 @@ export default function DtcInvestigation() {
       </Paper>
 
       {/* ── FLEET DTC DISTRIBUTION + HISTORY LOG ── */}
-      <Box sx={{ display: 'flex', gap: 2 }}>
+      <Box sx={{ display: 'flex', gap: 2, flex: 1, minHeight: 0 }}>
 
         {/* Fleet DTC Distribution */}
-        <Paper sx={{ flex: 1, p: 1.5, borderRadius: 0, height: 360, display: 'flex', flexDirection: 'column' }}>
+        <Paper sx={{ flex: 1, p: 1.5, borderRadius: 0, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
           <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161', mb: 0.5 }}>
             FLEET DTC DISTRIBUTION — most frequent fault codes across all vehicles
           </Typography>
@@ -470,7 +470,7 @@ export default function DtcInvestigation() {
                     cursor="pointer"
                   >
                     {distributionData.map((d: any, i: number) => (
-                      <rect key={i} fill={d.severity === 'critical' || d.severity === 'CRITICAL' ? '#ef9a9a' : '#ffcc80'} />
+                      <Cell key={i} fill={d.severity === 'critical' || d.severity === 'CRITICAL' ? '#ef9a9a' : '#ffcc80'} />
                     ))}
                   </Bar>
                 </BarChart>
@@ -486,11 +486,11 @@ export default function DtcInvestigation() {
         </Paper>
 
         {/* Investigation History Log */}
-        <Paper sx={{ flex: 1, p: 1.5, borderRadius: 0, display: 'flex', flexDirection: 'column' }}>
+        <Paper sx={{ flex: 1, p: 1.5, borderRadius: 0, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
           <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161', mb: 0.5 }}>
             INVESTIGATION HISTORY LOG — last 100 runs across fleet
           </Typography>
-          <Box sx={{ flex: 1, overflowY: 'auto', border: '1px solid #e0e0e0' }}>
+          <Box sx={{ flex: 1, minHeight: 0, overflowY: 'auto', border: '1px solid #e0e0e0' }}>
             <table style={{ width: '100%', borderCollapse: 'collapse', fontFamily: 'monospace', fontSize: '11px' }}>
               <thead>
                 <tr style={{ borderBottom: '2px solid #bdbdbd' }}>

@@ -1,4 +1,5 @@
 # File: C:\streaming_emulator\run.py
+import json
 import os
 import sys
 import time
@@ -26,7 +27,10 @@ if not os.path.exists(VENV_PYTHON):
 
 KAFKA_BIN_DIR = r"C:\kafka\bin\windows"
 KAFKA_LOG_DIR = r"C:\tmp\kafka-logs"
-ZK_LOG_DIR = r"C:\tmp\zookeeper"
+ZK_LOG_DIR = r"C:\tmp\zookeeper-data"
+
+DTC_HISTORY_FILE = os.path.join(ROOT_DIR, "data", "dtc_history.json")
+REPLAY_PID_FILE  = os.path.join(ROOT_DIR, ".replay.pid")
 
 KAFKA_TOPICS = [
     "telemetry.battery", 
@@ -374,7 +378,16 @@ def main():
         for script in RESET_SCRIPTS:
             script_path = os.path.join(ROOT_DIR, script)
             subprocess.run([VENV_PYTHON, script_path], input="yes\n", text=True)
-            
+
+        print("\n--- Clearing DTC History & Replay State ---")
+        if os.path.exists(DTC_HISTORY_FILE):
+            with open(DTC_HISTORY_FILE, "w", encoding="utf-8") as fh:
+                json.dump([], fh)
+            print("   ✅ DTC history cleared.")
+        if os.path.exists(REPLAY_PID_FILE):
+            os.remove(REPLAY_PID_FILE)
+            print("   ✅ Replay PID file cleared.")
+
     else:
         if not infra_is_running:
             print("\n--- Booting Infrastructure ---")
