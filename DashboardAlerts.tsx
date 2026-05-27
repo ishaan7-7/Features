@@ -77,7 +77,7 @@ export default function DashboardAlerts() {
           startIcon={<PsychologyIcon />}
           onClick={() =>
             navigate(
-              `/dtc?vehicle=${encodeURIComponent(params.data.source_id)}&module=${encodeURIComponent(params.data.module)}&peak_ts=${encodeURIComponent(params.data.peak_anomaly_ts)}`,
+              `/dtc?tab=1&vehicle=${encodeURIComponent(params.data.source_id)}&module=${encodeURIComponent(params.data.module)}&peak_ts=${encodeURIComponent(params.data.peak_anomaly_ts)}`,
             )
           }
           sx={{ height: '24px', fontSize: '10px', mt: 0.5, borderRadius: 0, boxShadow: 'none' }}
