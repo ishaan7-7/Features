@@ -524,7 +524,14 @@ def get_automotive_vehicle_health_history(vehicle_id: str):
 @router.get("/api/automotive/vehicle-decomposition/{vehicle_id}")
 def get_vehicle_module_decomposition(vehicle_id: str):
     import pandas as pd
-    mod_dfs: list = []
+    import logging
+    _log = logging.getLogger(__name__)
+
+    def _to_ts_naive(series: "pd.Series") -> "pd.Series":
+        parsed = pd.to_datetime(series, errors="coerce", utc=True)
+        return parsed.dt.tz_convert(None)
+
+    mod_series: dict = {}
     for mod in _VEHICLE_MODULES:
         silver_path = os.path.join(_SILVER_ROOT, mod)
         if not os.path.exists(silver_path):
@@ -545,34 +552,47 @@ def get_vehicle_module_decomposition(vehicle_id: str):
                 pass
         if not dfs:
             continue
-        combined = pd.concat(dfs, ignore_index=True)
-        ts_col = next((c for c in ("inference_ts", "ingest_ts", "timestamp") if c in combined.columns), None)
-        if not ts_col:
+        try:
+            combined = pd.concat(dfs, ignore_index=True)
+            ts_col = next((c for c in ("timestamp", "ingest_ts", "inference_ts") if c in combined.columns), None)
+            if not ts_col:
+                continue
+            combined["_ts"] = _to_ts_naive(combined[ts_col])
+            combined = combined.dropna(subset=["_ts"]).sort_values("_ts").reset_index(drop=True)
+            if combined.empty:
+                continue
+            factor = max(1, len(combined) // 400)
+            if factor > 1:
+                combined = combined.iloc[::factor].reset_index(drop=True)
+            mod_series[mod] = combined[["_ts", "health_score"]].rename(columns={"health_score": f"{mod}_contrib"})
+        except Exception as exc:
+            _log.warning(f"vehicle-decomposition: skipping {mod} for {vehicle_id}: {exc}")
             continue
-        combined["_ts"] = pd.to_datetime(combined[ts_col], errors="coerce")
-        combined = combined.dropna(subset=["_ts"]).sort_values("_ts")
-        combined["ts_key"] = combined["_ts"].dt.strftime("%Y-%m-%d %H:%M")
-        grouped = combined.groupby("ts_key")["health_score"].mean().reset_index()
-        grouped = grouped.rename(columns={"health_score": f"{mod}_contrib"})
-        factor = max(1, len(grouped) // 400)
-        if factor > 1:
-            grouped = grouped.iloc[::factor].reset_index(drop=True)
-        mod_dfs.append(grouped.set_index("ts_key"))
 
-    if not mod_dfs:
-        if _PRESENTATION_MODE_ACTIVE and vehicle_id in _DEMO_VEHICLE_HEALTH_CACHE:
-            return {"data": _DEMO_VEHICLE_HEALTH_CACHE[vehicle_id], "vehicle_id": vehicle_id}
+    if not mod_series:
         return {"data": [], "vehicle_id": vehicle_id}
 
-    result = mod_dfs[0]
-    for mdf in mod_dfs[1:]:
-        result = result.join(mdf, how="outer")
-
-    result = result.sort_index().ffill().bfill().fillna(100.0)
-    result = result.reset_index().rename(columns={"ts_key": "ts"})
-    result = result.tail(2000)
-
-    return {"data": result.to_dict(orient="records"), "vehicle_id": vehicle_id}
+    try:
+        mods = list(mod_series.keys())
+        result = mod_series[mods[0]].sort_values("_ts").reset_index(drop=True)
+        for mod in mods[1:]:
+            other = mod_series[mod].sort_values("_ts").reset_index(drop=True)
+            result = pd.merge_asof(
+                result, other, on="_ts", direction="nearest", tolerance=pd.Timedelta("10min")
+            )
+        result = result.fillna(100.0)
+        result["ts"] = result["_ts"].dt.strftime("%Y-%m-%d %H:%M")
+        result = result.drop(columns=["_ts"]).tail(2000)
+        return {"data": result.to_dict(orient="records"), "vehicle_id": vehicle_id}
+    except Exception as exc:
+        _log.warning(f"vehicle-decomposition: merge failed for {vehicle_id}: {exc}")
+        first = list(mod_series.values())[0].copy()
+        first["ts"] = first["_ts"].dt.strftime("%Y-%m-%d %H:%M")
+        first = first.drop(columns=["_ts"]).tail(2000)
+        for m in _VEHICLE_MODULES:
+            if f"{m}_contrib" not in first.columns:
+                first[f"{m}_contrib"] = 100.0
+        return {"data": first.to_dict(orient="records"), "vehicle_id": vehicle_id}
 
 
 @router.get("/api/automotive/module-crossfleet/{module}")
