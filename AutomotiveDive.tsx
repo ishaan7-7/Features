@@ -725,7 +725,7 @@ export default function AutomotiveDive() {
         itemStyle: { color: MODULE_COLORS[mod] },
         symbol: 'none',
         smooth: false,
-        data: decompositionHistory.map((r) => r[mod] ?? 0),
+        data: decompositionHistory.map((r) => (r as Record<string, number>)[mod] ?? 0),
         emphasis: { focus: 'series' as const },
       })),
     } as EChartsOption;
