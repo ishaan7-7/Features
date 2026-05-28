@@ -268,6 +268,14 @@ export default function AutomotiveDive() {
     refetchInterval: autoRefresh ? 3000 : false,
   });
 
+  const vehicleDecompQuery = useQuery({
+    queryKey: ['autoVehicleDecomp', selectedVehicle],
+    queryFn: () =>
+      axios.get(`${API}/api/automotive/vehicle-decomposition/${selectedVehicle}`).then((r) => r.data),
+    enabled: !!selectedVehicle && activeTab === 'vehicle',
+    refetchInterval: autoRefresh ? 5000 : false,
+  });
+
   // Module analysis cross-fleet (Bronze stats per vehicle per module)
   const crossfleetQuery = useQuery({
     queryKey: ['autoCrossfleet', analysisModule],
@@ -646,10 +654,8 @@ export default function AutomotiveDive() {
   };
 
   const decompositionHistory = useMemo(() => {
-    const raw: any[] = vehicleHealthQuery.data?.data || [];
-    const factor = Math.max(1, Math.floor(raw.length / 400));
-    const sampled = factor === 1 ? raw : raw.filter((_: any, i: number) => i % factor === 0);
-    return sampled.map((r: any) => ({
+    const raw: any[] = vehicleDecompQuery.data?.data || [];
+    return raw.map((r: any) => ({
       ts: r.ts || String(r.timestamp || '').slice(5, 16),
       mileage: r.mileage ?? 0,
       ...Object.fromEntries(
@@ -659,7 +665,7 @@ export default function AutomotiveDive() {
         ])
       ),
     }));
-  }, [vehicleHealthQuery.data]);
+  }, [vehicleDecompQuery.data]);
 
   const radarData = useMemo(() => {
     const v = vehicles.find((v: any) => v.vehicle_id === selectedVehicle);
@@ -857,7 +863,7 @@ export default function AutomotiveDive() {
                 <Chip size="small" label={vehicleHealthQuery.data?.data_source || '—'}
                   sx={{ borderRadius: 0, fontWeight: 'bold', fontSize: '10px', height: 18 }} />
               </Box>
-              <Box sx={{ flex: 1 }}>
+              <Box sx={{ flex: 1, minHeight: 0 }}>
                 <ResponsiveContainer width="100%" height="100%">
                   <LineChart data={healthHistory} margin={{ top: 4, right: 15, left: -25, bottom: 20 }}>
                     <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#eeeeee" />

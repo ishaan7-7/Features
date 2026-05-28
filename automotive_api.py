@@ -508,33 +508,6 @@ def get_automotive_vehicle_health_history(vehicle_id: str):
             for col in combined.select_dtypes(include=["datetime64[ns]", "datetime64[ns, UTC]"]).columns:
                 combined[col] = combined[col].astype(str)
 
-            has_contrib = any(c.endswith("_contrib") for c in combined.columns if combined[c].astype(float).max() > 0)
-            if not has_contrib:
-                silver_by_mod: dict = {}
-                for mod in _VEHICLE_MODULES:
-                    sp = os.path.join(_SILVER_ROOT, mod)
-                    if not os.path.exists(sp):
-                        continue
-                    sfiles = sorted(
-                        [os.path.join(r, f) for r, _d2, ff in os.walk(sp) for f in ff if f.endswith(".parquet")],
-                        key=os.path.getmtime, reverse=True,
-                    )
-                    sdfs = []
-                    for sfp in sfiles[:20]:
-                        try:
-                            sdf = pd.read_parquet(sfp)
-                            if not sdf.empty and "source_id" in sdf.columns and "health_score" in sdf.columns:
-                                sv = sdf[sdf["source_id"] == vehicle_id][["health_score"]].copy()
-                                if not sv.empty:
-                                    sdfs.append(sv)
-                        except Exception:
-                            pass
-                    if sdfs:
-                        silver_by_mod[mod] = pd.concat(sdfs, ignore_index=True)["health_score"].mean()
-
-                for mod, avg_h in silver_by_mod.items():
-                    combined[f"{mod}_contrib"] = round(float(avg_h), 2)
-
             keep = [c for c in ("ts", "vehicle_health_score", "mileage") if c in combined.columns]
             keep += [c for c in combined.columns if c.endswith("_contrib")]
             out = combined[keep].tail(2000).rename(columns={"vehicle_health_score": "health"})
@@ -546,6 +519,60 @@ def get_automotive_vehicle_health_history(vehicle_id: str):
         data_source = "demo"
 
     return {"data": rows, "data_source": data_source, "vehicle_id": vehicle_id, "count": len(rows)}
+
+
+@router.get("/api/automotive/vehicle-decomposition/{vehicle_id}")
+def get_vehicle_module_decomposition(vehicle_id: str):
+    import pandas as pd
+    mod_dfs: list = []
+    for mod in _VEHICLE_MODULES:
+        silver_path = os.path.join(_SILVER_ROOT, mod)
+        if not os.path.exists(silver_path):
+            continue
+        pfiles = sorted(
+            [os.path.join(r, f) for r, _d, ff in os.walk(silver_path) for f in ff if f.endswith(".parquet")],
+            key=os.path.getmtime, reverse=True,
+        )
+        dfs: list = []
+        for fp in pfiles[:20]:
+            try:
+                df = pd.read_parquet(fp)
+                if not df.empty and "source_id" in df.columns and "health_score" in df.columns:
+                    vdf = df[df["source_id"] == vehicle_id]
+                    if not vdf.empty:
+                        dfs.append(vdf)
+            except Exception:
+                pass
+        if not dfs:
+            continue
+        combined = pd.concat(dfs, ignore_index=True)
+        ts_col = next((c for c in ("inference_ts", "ingest_ts", "timestamp") if c in combined.columns), None)
+        if not ts_col:
+            continue
+        combined["_ts"] = pd.to_datetime(combined[ts_col], errors="coerce")
+        combined = combined.dropna(subset=["_ts"]).sort_values("_ts")
+        combined["ts_key"] = combined["_ts"].dt.strftime("%Y-%m-%d %H:%M")
+        grouped = combined.groupby("ts_key")["health_score"].mean().reset_index()
+        grouped = grouped.rename(columns={"health_score": f"{mod}_contrib"})
+        factor = max(1, len(grouped) // 400)
+        if factor > 1:
+            grouped = grouped.iloc[::factor].reset_index(drop=True)
+        mod_dfs.append(grouped.set_index("ts_key"))
+
+    if not mod_dfs:
+        if _PRESENTATION_MODE_ACTIVE and vehicle_id in _DEMO_VEHICLE_HEALTH_CACHE:
+            return {"data": _DEMO_VEHICLE_HEALTH_CACHE[vehicle_id], "vehicle_id": vehicle_id}
+        return {"data": [], "vehicle_id": vehicle_id}
+
+    result = mod_dfs[0]
+    for mdf in mod_dfs[1:]:
+        result = result.join(mdf, how="outer")
+
+    result = result.sort_index().ffill().bfill().fillna(100.0)
+    result = result.reset_index().rename(columns={"ts_key": "ts"})
+    result = result.tail(2000)
+
+    return {"data": result.to_dict(orient="records"), "vehicle_id": vehicle_id}
 
 
 @router.get("/api/automotive/module-crossfleet/{module}")
