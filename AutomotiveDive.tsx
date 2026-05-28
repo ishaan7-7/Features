@@ -698,7 +698,7 @@ export default function AutomotiveDive() {
         { type: 'inside', xAxisIndex: 0 },
         { type: 'slider', xAxisIndex: 0, bottom: 2, height: 18, borderColor: '#e0e0e0', fillerColor: 'rgba(25,118,210,0.08)', handleStyle: { color: '#1976d2' } },
       ],
-      grid: { top: 28, right: 12, bottom: 44, left: 48 },
+      grid: { top: 28, right: 12, bottom: 40, left: 48 },
       xAxis: {
         type: 'category',
         data: xData,
@@ -710,8 +710,7 @@ export default function AutomotiveDive() {
       yAxis: {
         type: 'value',
         min: 0,
-        max: 100,
-        axisLabel: { fontFamily: 'monospace', fontSize: 10, color: '#616161', formatter: '{value}%' },
+        axisLabel: { fontFamily: 'monospace', fontSize: 10, color: '#616161' },
         axisLine: { show: false },
         axisTick: { show: false },
         splitLine: { lineStyle: { type: 'dashed', color: '#eeeeee' } },
@@ -1034,7 +1033,7 @@ export default function AutomotiveDive() {
           </Box>
 
           {/* ── ROW A: Health decomposition stacked area ── */}
-          <Paper sx={{ p: 1.5, borderRadius: 0, height: 260, display: 'flex', flexDirection: 'column' }}>
+          <Paper sx={{ p: 1.5, borderRadius: 0, height: 320, display: 'flex', flexDirection: 'column' }}>
             <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 0.5 }}>
               <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161' }}>
                 HEALTH DECOMPOSITION — ALL MODULE CONTRIBUTIONS OVER TIME &nbsp;
