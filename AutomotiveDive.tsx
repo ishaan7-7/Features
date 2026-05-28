@@ -667,6 +667,70 @@ export default function AutomotiveDive() {
     }));
   }, [vehicleDecompQuery.data]);
 
+  const decompositionOption = useMemo((): EChartsOption => {
+    if (!decompositionHistory.length) return {};
+    const xData = decompositionHistory.map((r) => r.ts);
+    return {
+      tooltip: {
+        trigger: 'axis',
+        backgroundColor: '#fff',
+        borderColor: '#e0e0e0',
+        borderWidth: 1,
+        padding: [8, 12],
+        textStyle: { fontFamily: 'monospace', fontSize: 11 },
+        axisPointer: { type: 'line', lineStyle: { color: '#bdbdbd', type: 'dashed' } },
+        formatter: (params: any) =>
+          (params as any[])
+            .filter((p: any) => p.value > 0)
+            .sort((a: any, b: any) => b.value - a.value)
+            .map((p: any) => `<span style="display:inline-block;width:8px;height:8px;background:${p.color};margin-right:4px"></span>${p.seriesName}: <b>${p.value}%</b>`)
+            .join('<br/>'),
+      },
+      legend: {
+        data: ALL_MODULES.map((m) => m.toUpperCase()),
+        textStyle: { fontFamily: 'monospace', fontSize: 10 },
+        itemHeight: 8,
+        top: 2,
+        right: 8,
+        icon: 'circle',
+      },
+      dataZoom: [
+        { type: 'inside', xAxisIndex: 0 },
+        { type: 'slider', xAxisIndex: 0, bottom: 2, height: 18, borderColor: '#e0e0e0', fillerColor: 'rgba(25,118,210,0.08)', handleStyle: { color: '#1976d2' } },
+      ],
+      grid: { top: 28, right: 12, bottom: 44, left: 48 },
+      xAxis: {
+        type: 'category',
+        data: xData,
+        axisLabel: { fontFamily: 'monospace', fontSize: 10, color: '#616161', formatter: (v: string) => formatXTick(v, xAxisMode) },
+        axisLine: { lineStyle: { color: '#bdbdbd' } },
+        axisTick: { show: false },
+        splitLine: { show: false },
+      },
+      yAxis: {
+        type: 'value',
+        min: 0,
+        max: 100,
+        axisLabel: { fontFamily: 'monospace', fontSize: 10, color: '#616161', formatter: '{value}%' },
+        axisLine: { show: false },
+        axisTick: { show: false },
+        splitLine: { lineStyle: { type: 'dashed', color: '#eeeeee' } },
+      },
+      series: ALL_MODULES.map((mod) => ({
+        name: mod.toUpperCase(),
+        type: 'line' as const,
+        stack: 'decomp',
+        areaStyle: { color: MODULE_COLORS[mod], opacity: 0.75 },
+        lineStyle: { color: MODULE_COLORS[mod], width: 1 },
+        itemStyle: { color: MODULE_COLORS[mod] },
+        symbol: 'none',
+        smooth: false,
+        data: decompositionHistory.map((r) => r[mod] ?? 0),
+        emphasis: { focus: 'series' as const },
+      })),
+    } as EChartsOption;
+  }, [decompositionHistory, xAxisMode]);
+
   const radarData = useMemo(() => {
     const v = vehicles.find((v: any) => v.vehicle_id === selectedVehicle);
     if (!v) return ALL_MODULES.map((mod) => ({ module: mod.toUpperCase(), score: 0, fullMark: 100 }));
@@ -993,19 +1057,7 @@ export default function AutomotiveDive() {
             </Box>
             <Box sx={{ flex: 1, minHeight: 0 }}>
               {decompositionHistory.length > 0 ? (
-                <ResponsiveContainer width="100%" height="100%">
-                  <AreaChart data={decompositionHistory} margin={{ top: 4, right: 15, left: -25, bottom: 20 }}>
-                    <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#eeeeee" />
-                    <XAxis dataKey={xAxisMode === 'mileage' ? 'mileage' : 'ts'} tick={axisStyle} axisLine={{ stroke: '#bdbdbd' }} tickLine={false} minTickGap={40} tickFormatter={(v) => formatXTick(v, xAxisMode)} />
-                    <YAxis domain={[0, 100]} tick={axisStyle} axisLine={{ stroke: '#bdbdbd' }} tickLine={false} unit="%" />
-                    <Tooltip contentStyle={{ borderRadius: 0, fontSize: '11px', padding: '6px 10px' }} formatter={(v: any, name: any) => [`${v}%`, String(name).toUpperCase()]} />
-                    <Legend wrapperStyle={{ fontSize: '10px', fontWeight: 'bold', paddingTop: 2 }} />
-                    {ALL_MODULES.map((mod) => (
-                      <Area key={mod} stackId="decomp" type="monotone" dataKey={mod} name={mod} stroke={MODULE_COLORS[mod]} fill={MODULE_COLORS[mod]} fillOpacity={0.75} strokeWidth={1} dot={false} isAnimationActive={false} />
-                    ))}
-                    <Brush dataKey={xAxisMode === 'mileage' ? 'mileage' : 'ts'} height={18} stroke="#bdbdbd" travellerWidth={6} />
-                  </AreaChart>
-                </ResponsiveContainer>
+                <EChart option={decompositionOption} style={{ height: '100%', width: '100%' }} />
               ) : (
                 <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%' }}>
                   <Typography variant="caption" sx={{ color: '#9e9e9e' }}>
