@@ -500,11 +500,41 @@ def get_automotive_vehicle_health_history(vehicle_id: str):
                 combined["gold_window_ts"] = pd.to_datetime(combined["gold_window_ts"])
                 combined = combined.sort_values("gold_window_ts")
                 combined["ts"] = combined["gold_window_ts"].dt.strftime("%Y-%m-%d %H:%M")
+            if "ts" not in combined.columns:
+                combined["ts"] = combined.index.astype(str)
             combined["timestamp"] = combined["ts"]
             combined = _attach_mileage(combined, vehicle_id)
             combined = combined.fillna(0)
             for col in combined.select_dtypes(include=["datetime64[ns]", "datetime64[ns, UTC]"]).columns:
                 combined[col] = combined[col].astype(str)
+
+            has_contrib = any(c.endswith("_contrib") for c in combined.columns if combined[c].astype(float).max() > 0)
+            if not has_contrib:
+                silver_by_mod: dict = {}
+                for mod in _VEHICLE_MODULES:
+                    sp = os.path.join(_SILVER_ROOT, mod)
+                    if not os.path.exists(sp):
+                        continue
+                    sfiles = sorted(
+                        [os.path.join(r, f) for r, _d2, ff in os.walk(sp) for f in ff if f.endswith(".parquet")],
+                        key=os.path.getmtime, reverse=True,
+                    )
+                    sdfs = []
+                    for sfp in sfiles[:20]:
+                        try:
+                            sdf = pd.read_parquet(sfp)
+                            if not sdf.empty and "source_id" in sdf.columns and "health_score" in sdf.columns:
+                                sv = sdf[sdf["source_id"] == vehicle_id][["health_score"]].copy()
+                                if not sv.empty:
+                                    sdfs.append(sv)
+                        except Exception:
+                            pass
+                    if sdfs:
+                        silver_by_mod[mod] = pd.concat(sdfs, ignore_index=True)["health_score"].mean()
+
+                for mod, avg_h in silver_by_mod.items():
+                    combined[f"{mod}_contrib"] = round(float(avg_h), 2)
+
             keep = [c for c in ("ts", "vehicle_health_score", "mileage") if c in combined.columns]
             keep += [c for c in combined.columns if c.endswith("_contrib")]
             out = combined[keep].tail(2000).rename(columns={"vehicle_health_score": "health"})

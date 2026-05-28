@@ -33,6 +33,10 @@ const MODULE_COLORS: Record<string, string> = {
   body: '#ba68c8', tyre: '#4dd0e1',
 };
 
+const MODULE_WEIGHTS: Record<string, number> = {
+  engine: 0.35, transmission: 0.25, battery: 0.20, body: 0.10, tyre: 0.10,
+};
+
 type XAxisMode = 'timestamp' | 'mileage';
 type PageTab = 'fleet' | 'vehicle' | 'module';
 
@@ -648,7 +652,12 @@ export default function AutomotiveDive() {
     return sampled.map((r: any) => ({
       ts: r.ts || String(r.timestamp || '').slice(5, 16),
       mileage: r.mileage ?? 0,
-      ...Object.fromEntries(ALL_MODULES.map((mod) => [mod, Math.round(r[`${mod}_contrib`] ?? 0)])),
+      ...Object.fromEntries(
+        ALL_MODULES.map((mod) => [
+          mod,
+          parseFloat(((r[`${mod}_contrib`] ?? 0) * (MODULE_WEIGHTS[mod] ?? 0.2)).toFixed(2)),
+        ])
+      ),
     }));
   }, [vehicleHealthQuery.data]);
 
@@ -966,11 +975,11 @@ export default function AutomotiveDive() {
                   <AreaChart data={decompositionHistory} margin={{ top: 4, right: 15, left: -25, bottom: 20 }}>
                     <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#eeeeee" />
                     <XAxis dataKey={xAxisMode === 'mileage' ? 'mileage' : 'ts'} tick={axisStyle} axisLine={{ stroke: '#bdbdbd' }} tickLine={false} minTickGap={40} tickFormatter={(v) => formatXTick(v, xAxisMode)} />
-                    <YAxis domain={[0, 100]} tick={axisStyle} axisLine={{ stroke: '#bdbdbd' }} tickLine={false} />
-                    <Tooltip contentStyle={{ borderRadius: 0, fontSize: '11px', padding: '6px 10px' }} formatter={(v: any) => [`${v}%`]} />
+                    <YAxis domain={[0, 100]} tick={axisStyle} axisLine={{ stroke: '#bdbdbd' }} tickLine={false} unit="%" />
+                    <Tooltip contentStyle={{ borderRadius: 0, fontSize: '11px', padding: '6px 10px' }} formatter={(v: any, name: any) => [`${v}%`, String(name).toUpperCase()]} />
                     <Legend wrapperStyle={{ fontSize: '10px', fontWeight: 'bold', paddingTop: 2 }} />
                     {ALL_MODULES.map((mod) => (
-                      <Area key={mod} type="monotone" dataKey={mod} name={mod.toUpperCase()} stroke={MODULE_COLORS[mod]} fill={MODULE_COLORS[mod]} fillOpacity={0.15} strokeWidth={1.5} dot={false} isAnimationActive={false} />
+                      <Area key={mod} stackId="decomp" type="monotone" dataKey={mod} name={mod} stroke={MODULE_COLORS[mod]} fill={MODULE_COLORS[mod]} fillOpacity={0.75} strokeWidth={1} dot={false} isAnimationActive={false} />
                     ))}
                     <Brush dataKey={xAxisMode === 'mileage' ? 'mileage' : 'ts'} height={18} stroke="#bdbdbd" travellerWidth={6} />
                   </AreaChart>
