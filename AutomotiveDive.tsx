@@ -971,10 +971,26 @@ export default function AutomotiveDive() {
 
           {/* ── ROW A: Health decomposition stacked area ── */}
           <Paper sx={{ p: 1.5, borderRadius: 0, height: 260, display: 'flex', flexDirection: 'column' }}>
-            <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161', mb: 0.5 }}>
-              HEALTH DECOMPOSITION — ALL MODULE CONTRIBUTIONS OVER TIME &nbsp;
-              <span style={{ color: '#9e9e9e', fontWeight: 'normal' }}>(GOLD)</span>
-            </Typography>
+            <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 0.5 }}>
+              <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161' }}>
+                HEALTH DECOMPOSITION — ALL MODULE CONTRIBUTIONS OVER TIME &nbsp;
+                <span style={{ color: '#9e9e9e', fontWeight: 'normal' }}>(SILVER)</span>
+              </Typography>
+              <Chip
+                size="small"
+                label={
+                  vehicleDecompQuery.isLoading ? 'loading…'
+                  : vehicleDecompQuery.isError ? 'endpoint missing — restart backend'
+                  : decompositionHistory.length > 0 ? `${decompositionHistory.length} pts`
+                  : 'no data'
+                }
+                sx={{
+                  borderRadius: 0, fontWeight: 'bold', fontSize: '10px', height: 18,
+                  bgcolor: vehicleDecompQuery.isError ? '#ffebee' : 'default',
+                  color: vehicleDecompQuery.isError ? '#d32f2f' : 'default',
+                }}
+              />
+            </Box>
             <Box sx={{ flex: 1, minHeight: 0 }}>
               {decompositionHistory.length > 0 ? (
                 <ResponsiveContainer width="100%" height="100%">
@@ -992,7 +1008,13 @@ export default function AutomotiveDive() {
                 </ResponsiveContainer>
               ) : (
                 <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%' }}>
-                  <Typography variant="caption" sx={{ color: '#9e9e9e' }}>No gold history — select a vehicle and load data</Typography>
+                  <Typography variant="caption" sx={{ color: '#9e9e9e' }}>
+                    {vehicleDecompQuery.isError
+                      ? 'Restart backend to load new endpoint (dash_backend)'
+                      : vehicleDecompQuery.isLoading
+                      ? 'Loading module decomposition…'
+                      : 'No silver history for this vehicle'}
+                  </Typography>
                 </Box>
               )}
             </Box>
