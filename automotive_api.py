@@ -210,6 +210,21 @@ def _seed_all_demo_data() -> None:
         _DEMO_VEHICLE_HEALTH_CACHE[vid] = _generate_vehicle_health_history(_DEMO_SILVER_CACHE[vid])
 
 
+# ── Bronze parquet reader — injects source_id from Hive partition path ───────
+
+def _read_bronze_parquet(fp: str):
+    import pandas as pd
+    df = pd.read_parquet(fp)
+    if df.empty:
+        return df
+    if "source_id" not in df.columns:
+        for part in fp.replace("\\", "/").split("/"):
+            if part.startswith("source_id="):
+                df["source_id"] = part.split("=", 1)[1]
+                break
+    return df
+
+
 # ── Mileage join helper ───────────────────────────────────────────────────────
 
 def _attach_mileage(combined, vehicle_id: str):
@@ -581,13 +596,13 @@ def get_vehicle_module_decomposition(vehicle_id: str):
                 result, other, on="_ts", direction="nearest", tolerance=pd.Timedelta("10min")
             )
         result = result.fillna(100.0)
-        result["ts"] = result["_ts"].dt.strftime("%Y-%m-%d %H:%M")
+        result["ts"] = result["_ts"].dt.strftime("%Y-%m-%d %H:%M:%S")
         result = result.drop(columns=["_ts"]).tail(2000)
         return {"data": result.to_dict(orient="records"), "vehicle_id": vehicle_id}
     except Exception as exc:
         _log.warning(f"vehicle-decomposition: merge failed for {vehicle_id}: {exc}")
         first = list(mod_series.values())[0].copy()
-        first["ts"] = first["_ts"].dt.strftime("%Y-%m-%d %H:%M")
+        first["ts"] = first["_ts"].dt.strftime("%Y-%m-%d %H:%M:%S")
         first = first.drop(columns=["_ts"]).tail(2000)
         for m in _VEHICLE_MODULES:
             if f"{m}_contrib" not in first.columns:
@@ -614,7 +629,7 @@ def get_automotive_module_crossfleet(module: str):
         dfs = []
         for fp in pfiles[:30]:
             try:
-                df = pd.read_parquet(fp)
+                df = _read_bronze_parquet(fp)
                 if not df.empty and "source_id" in df.columns:
                     dfs.append(df)
             except Exception:
@@ -865,7 +880,7 @@ def get_module_sensor_stats(module: str):
         dfs = []
         for fp in pfiles[:30]:
             try:
-                df = pd.read_parquet(fp)
+                df = _read_bronze_parquet(fp)
                 if not df.empty and "source_id" in df.columns:
                     dfs.append(df)
             except Exception:
@@ -924,7 +939,7 @@ def get_module_sensor_fleet_history(module: str, sensor: str):
         dfs = []
         for fp in pfiles[:30]:
             try:
-                df = pd.read_parquet(fp)
+                df = _read_bronze_parquet(fp)
                 if not df.empty and "source_id" in df.columns and sensor in df.columns:
                     ts_col = next((c for c in ("timestamp", "ingest_ts") if c in df.columns), None)
                     if ts_col:

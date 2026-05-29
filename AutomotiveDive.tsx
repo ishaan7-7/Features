@@ -331,12 +331,12 @@ export default function AutomotiveDive() {
   });
 
   const moduleSensorFleetHistoryQuery = useQuery({
-    queryKey: ['moduleSensorFleetHistory', analysisModule, analysisKey],
+    queryKey: ['moduleSensorFleetHistory', analysisModule, distributionKey],
     queryFn: () =>
       axios
-        .get(`${API}/api/automotive/module-sensor-fleet-history/${analysisModule}/${analysisKey}`)
+        .get(`${API}/api/automotive/module-sensor-fleet-history/${analysisModule}/${distributionKey}`)
         .then((r) => r.data),
-    enabled: activeTab === 'module' && !!analysisKey,
+    enabled: activeTab === 'module' && !!distributionKey,
     refetchInterval: false,
   });
 
@@ -577,7 +577,7 @@ export default function AutomotiveDive() {
       p75: v[`${sk}_p75`] ?? 0,
       max: v[`${sk}_max`] ?? 0,
     }));
-  }, [moduleSensorStatsQuery.data, currentAnalysisKey]);
+  }, [moduleSensorStatsQuery.data, distributionKey, currentAnalysisKey]);
 
   const sensorFleetVehicles: string[] = moduleFleetHealthQuery.data?.vehicles || [];
 
@@ -1689,15 +1689,6 @@ export default function AutomotiveDive() {
               ))}
             </ToggleButtonGroup>
 
-            {sensorKeys.length > 0 && (
-              <FormControl size="small" sx={{ minWidth: 280 }}>
-                <InputLabel>Sensor</InputLabel>
-                <Select value={currentAnalysisKey} onChange={(e) => setAnalysisKey(e.target.value)} label="Sensor" sx={{ borderRadius: 0 }}>
-                  {sensorKeys.map((k) => <MenuItem key={k} value={k}>{k.replace(/_/g, ' ').toUpperCase()}</MenuItem>)}
-                </Select>
-              </FormControl>
-            )}
-
             <TimeRangePicker value={analysisTimeRange} onChange={setAnalysisTimeRange} minWidth={160} />
           </Paper>
 
@@ -1869,15 +1860,15 @@ export default function AutomotiveDive() {
           {/* ── SECTION: Sensor fleet history comparison ── */}
           <Paper sx={{ p: 1.5, borderRadius: 0 }}>
             <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161', mb: 0.5, display: 'block' }}>
-              SENSOR COMPARISON — {currentAnalysisKey.replace(/_/g, ' ').toUpperCase()} ALL VEHICLES &nbsp;
-              <span style={{ color: '#9e9e9e', fontWeight: 'normal' }}>(BRONZE)</span>
+              SENSOR COMPARISON — {(distributionKey || sensorKeys[0] || '').replace(/_/g, ' ').toUpperCase()} ALL VEHICLES &nbsp;
+              <span style={{ color: '#9e9e9e', fontWeight: 'normal' }}>(BRONZE · uses sensor selected in Distribution table above)</span>
             </Typography>
             <EChart
               option={sensorComparisonOption}
               style={{ height: '260px', width: '100%' }}
               loading={moduleSensorFleetHistoryQuery.isLoading}
               empty={sensorFleetHistoryData.length === 0 || (sensorFleetHistorySeries as string[]).length === 0}
-              emptyText={moduleSensorFleetHistoryQuery.isLoading ? 'Loading…' : 'Select a sensor to compare across fleet'}
+              emptyText={!distributionKey ? 'Pick a sensor in the Distribution table above' : moduleSensorFleetHistoryQuery.isLoading ? 'Loading…' : 'No bronze data for this sensor'}
             />
           </Paper>
 
