@@ -329,16 +329,6 @@ export default function AutomotiveDive() {
     refetchInterval: false,
   });
 
-  const moduleSensorFleetHistoryQuery = useQuery({
-    queryKey: ['moduleSensorFleetHistory', analysisModule, distributionKey],
-    queryFn: () =>
-      axios
-        .get(`${API}/api/automotive/module-sensor-fleet-history/${analysisModule}/${distributionKey}`)
-        .then((r) => r.data),
-    enabled: activeTab === 'module' && !!distributionKey,
-    refetchInterval: false,
-  });
-
   const moduleTopFeaturesQuery = useQuery({
     queryKey: ['moduleTopFeatures', analysisModule],
     queryFn: () => axios.get(`${API}/api/automotive/module-top-features/${analysisModule}`).then((r) => r.data),
@@ -572,18 +562,6 @@ export default function AutomotiveDive() {
   }, [moduleSensorStatsQuery.data, distributionKey]);
 
   const sensorFleetVehicles: string[] = moduleFleetHealthQuery.data?.vehicles || [];
-
-  const sensorFleetHistorySeries = useMemo(() => {
-    return moduleSensorFleetHistoryQuery.data?.vehicles || [] as string[];
-  }, [moduleSensorFleetHistoryQuery.data]);
-
-  const sensorFleetHistoryData = useMemo(() => {
-    const raw: any[] = moduleSensorFleetHistoryQuery.data?.series || [];
-    const cutoff = analysisTimeRange < 8760
-      ? new Date(Date.now() - analysisTimeRange * 60 * 60 * 1000)
-      : null;
-    return cutoff ? raw.filter((r: any) => new Date(r.ts) >= cutoff) : raw;
-  }, [moduleSensorFleetHistoryQuery.data, analysisTimeRange]);
 
   const topFeaturesData = useMemo(
     () => (moduleTopFeaturesQuery.data?.features || []).slice(0, 12) as any[],
@@ -819,60 +797,6 @@ export default function AutomotiveDive() {
   }, [vehicleTimelineSensorKey, allVehicleSensorKeys, selectedVehicle]);
 
 
-  const sensorComparisonOption = useMemo((): EChartsOption => {
-    if (!sensorFleetHistoryData.length || !(sensorFleetHistorySeries as string[]).length) return {};
-    const VID_COLORS = ['#e53935', '#fb8c00', '#8e24aa', '#1e88e5', '#43a047', '#6d4c41'];
-    return {
-      tooltip: {
-        trigger: 'axis',
-        backgroundColor: '#fff',
-        borderColor: '#e0e0e0',
-        borderWidth: 1,
-        padding: [8, 12],
-        textStyle: { fontFamily: 'monospace', fontSize: 11 },
-        axisPointer: { type: 'line', lineStyle: { color: '#bdbdbd', type: 'dashed' } },
-      },
-      legend: {
-        data: (sensorFleetHistorySeries as string[]).map((v) => ({ name: v })),
-        textStyle: { fontFamily: 'monospace', fontSize: 10 },
-        itemHeight: 8,
-        top: 4,
-        right: 8,
-        type: 'scroll' as const,
-        icon: 'circle',
-      },
-      dataZoom: [
-        { type: 'inside', xAxisIndex: 0 },
-        { type: 'slider', xAxisIndex: 0, bottom: 2, height: 18, borderColor: '#e0e0e0', fillerColor: 'rgba(25,118,210,0.08)', handleStyle: { color: '#1976d2' } },
-      ],
-      grid: { top: 32, right: 16, bottom: 44, left: 52 },
-      xAxis: {
-        type: 'category',
-        data: sensorFleetHistoryData.map((r: any) => r.ts),
-        axisLabel: { fontFamily: 'monospace', fontSize: 10, color: '#616161' },
-        axisLine: { lineStyle: { color: '#bdbdbd' } },
-        axisTick: { show: false },
-        splitLine: { show: false },
-      },
-      yAxis: {
-        type: 'value',
-        axisLabel: { fontFamily: 'monospace', fontSize: 10, color: '#616161' },
-        axisLine: { show: false },
-        axisTick: { show: false },
-        splitLine: { lineStyle: { type: 'dashed', color: '#eeeeee' } },
-      },
-      series: (sensorFleetHistorySeries as string[]).map((vid, i) => ({
-        name: vid,
-        type: 'line' as const,
-        data: sensorFleetHistoryData.map((r: any) => r[vid] ?? null),
-        symbol: 'none',
-        lineStyle: { color: VID_COLORS[i % VID_COLORS.length], width: 1.5 },
-        itemStyle: { color: VID_COLORS[i % VID_COLORS.length] },
-        smooth: false,
-        connectNulls: false,
-      })),
-    } as EChartsOption;
-  }, [sensorFleetHistoryData, sensorFleetHistorySeries]);
 
   const fleetTopFeaturesOption = useMemo((): EChartsOption => {
     if (!topFeaturesData.length) return {};
@@ -1761,21 +1685,6 @@ export default function AutomotiveDive() {
                 {moduleSensorStatsQuery.isLoading ? 'Loading…' : 'No bronze sensor data'}
               </Typography>
             )}
-          </Paper>
-
-          {/* ── SECTION: Sensor fleet history comparison ── */}
-          <Paper sx={{ p: 1.5, borderRadius: 0 }}>
-            <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161', mb: 0.5, display: 'block' }}>
-              SENSOR COMPARISON — {(distributionKey || sensorKeys[0] || '').replace(/_/g, ' ').toUpperCase()} ALL VEHICLES &nbsp;
-              <span style={{ color: '#9e9e9e', fontWeight: 'normal' }}>(BRONZE · uses sensor selected in Distribution table above)</span>
-            </Typography>
-            <EChart
-              option={sensorComparisonOption}
-              style={{ height: '260px', width: '100%' }}
-              loading={moduleSensorFleetHistoryQuery.isLoading}
-              empty={sensorFleetHistoryData.length === 0 || (sensorFleetHistorySeries as string[]).length === 0}
-              emptyText={!distributionKey ? 'Pick a sensor in the Distribution table above' : moduleSensorFleetHistoryQuery.isLoading ? 'Loading…' : 'No bronze data for this sensor'}
-            />
           </Paper>
 
           {/* ── SECTION DIVIDER ── */}
