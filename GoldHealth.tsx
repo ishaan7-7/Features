@@ -134,7 +134,6 @@ export default function GoldHealth() {
   
   // UNIFIED FILTER CONTEXT STATE
   const [filterSim, setFilterSim] = useState<string>('ALL');
-  const [filterModule, setFilterModule] = useState<string>('ALL');
 
   // Experimentation State — Profile A
   const [activeModules, setActiveModules] = useState<string[]>([]);
@@ -245,11 +244,8 @@ export default function GoldHealth() {
   // --- KPI LOGIC ---
   const displayLag = useMemo(() => {
     if (!metrics || !metrics.processing_lags) return 0;
-    if (filterModule === 'ALL') {
-      return Math.max(...Object.values(metrics.processing_lags as Record<string, number>));
-    }
-    return metrics.processing_lags[filterModule.toLowerCase()] || 0;
-  }, [metrics, filterModule]);
+    return Math.max(...Object.values(metrics.processing_lags as Record<string, number>));
+  }, [metrics]);
 
   // --- EXPERIMENTATION CALIBRATION LOGIC ---
   const handleToggleModule = (mod: string) => {
@@ -433,13 +429,6 @@ export default function GoldHealth() {
           </Select>
         </FormControl>
 
-        <FormControl size="small" sx={{ minWidth: 200 }}>
-          <InputLabel>Target Subsystem Lag</InputLabel>
-          <Select value={filterModule} onChange={(e) => setFilterModule(e.target.value)} label="Target Subsystem Lag" sx={{ borderRadius: 0 }}>
-            <MenuItem value="ALL" sx={{ fontWeight: 'bold' }}>MAX GLOBAL LAG</MenuItem>
-            {ALL_MODULES.map(mod => <MenuItem key={mod} value={mod.toUpperCase()}>{mod.toUpperCase()}</MenuItem>)}
-          </Select>
-        </FormControl>
       </Paper>
 
       {/* TAB 1: LIVE OPERATIONS */}
@@ -450,7 +439,7 @@ export default function GoldHealth() {
             {[
               { label: 'ACTIVE SIMULATIONS', value: availableSims.length },
               { label: 'TOTAL GOLD ROWS', value: metrics?.total_gold_rows?.toLocaleString() || 0 },
-              { label: filterModule === 'ALL' ? 'GLOBAL MAX LAG' : `${filterModule} LAG`, value: displayLag.toLocaleString(), color: displayLag > 1000 ? '#d32f2f' : '#212121' },
+              { label: 'GLOBAL MAX LAG', value: displayLag.toLocaleString(), color: displayLag > 1000 ? '#d32f2f' : '#212121' },
               { label: filterSim === 'ALL' ? 'FLEET AVG VEHICLE HEALTH' : 'CURRENT VEHICLE HEALTH', value: `${filterSim === 'ALL' ? fleetHealthKpi : (latestRow?.vehicle_health_score || 0)}%`, color: ((filterSim === 'ALL' ? fleetHealthKpi : (latestRow?.vehicle_health_score ?? 100)) < 60) ? '#d32f2f' : '#2e7d32' }
             ].map((kpi, idx) => (
               <Paper key={idx} sx={{ flex: 1, p: 2, borderRadius: 0, borderLeft: '4px solid #fbc02d' }}>
