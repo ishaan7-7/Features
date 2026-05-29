@@ -1,23 +1,20 @@
 import os
 import json
-import time
 import asyncio
-import pandas as pd
 from pathlib import Path
-from fastapi import FastAPI, HTTPException, Query
+import pandas as pd
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from confluent_kafka import Consumer, TopicPartition
 from deltalake import DeltaTable
 
 # --- Paths & Constants ---
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
-DELTA_ROOT = os.path.join(PROJECT_ROOT, "data", "delta", "bronze")
-STATE_DIR = os.path.join(CURRENT_DIR, "state")
+SILVER_ROOT = os.path.join(PROJECT_ROOT, "data", "delta", "silver")
+ALERTS_ROOT = os.path.join(PROJECT_ROOT, "data", "delta", "gold", "alerts")
+ALERTS_CHECKPOINT = os.path.join(CURRENT_DIR, "state", "checkpoints.json")
 
-VEHICLE_MODULES = ["battery", "body", "engine", "transmission", "tyre"]
-KAFKA_BROKER = "localhost:9092"
-SERVICE_START_TIME = time.time()
+VEHICLE_MODULES = ["engine", "transmission", "battery", "body", "tyre"]
 
 # --- Utils ---
 def safe_read_json(file_path):
@@ -30,21 +27,16 @@ def safe_read_json(file_path):
     return None
 
 # --- Cache ---
-WRITER_METRICS_CACHE = {
-    module: {
-        "module": module.upper(),
-        "status": "OFFLINE",
-        "kafka_total": 0,
-        "delta_total": 0,
-        "true_lag": 0,
-        "throughput": "0.0",
-        "processed": "0.0",
-        "latency_ms": 0
-    } for module in VEHICLE_MODULES
+ALERTS_METRICS_CACHE = {
+    "active_alerts_count": 0,
+    "critical_vehicles": 0,
+    "processing_lag": 0,
+    "open_alerts": [],
+    "closed_alerts": []
 }
 
 # --- App Definition ---
-app = FastAPI(title="Writer Service Backend")
+app = FastAPI(title="Alerts Service Backend")
 
 app.add_middleware(
     CORSMiddleware,
@@ -55,154 +47,82 @@ app.add_middleware(
 )
 
 # --- Background Logic ---
-class TelemetryBackend:
-    def __init__(self):
-        self.consumer = None
-        self._connect()
-        
-    def _connect(self):
+def _sync_update_alerts():
+    """Synchronous file I/O operations executed in a separate thread"""
+    global ALERTS_METRICS_CACHE
+    try:
+        lag_rows = 0
+        # 1. Calculate Lag using Checkpoints vs Silver
         try:
-            conf = {
-                'bootstrap.servers': KAFKA_BROKER, 
-                'group.id': 'writer_service_monitor', 
-                'auto.offset.reset': 'earliest',
-                'enable.auto.commit': False
-            }
-            self.consumer = Consumer(conf)
-        except Exception:
-            pass
+            if os.path.exists(ALERTS_CHECKPOINT) and os.path.exists(SILVER_ROOT):
+                ckpt = safe_read_json(ALERTS_CHECKPOINT) or {}
+                primary_mod = VEHICLE_MODULES[0]
+                last_ts = ckpt.get(primary_mod, "1970-01-01T00:00:00")
+                
+                silver_primary = os.path.join(SILVER_ROOT, primary_mod)
+                if os.path.exists(silver_primary):
+                    s_files = [os.path.join(r, f) for r, d, f in os.walk(silver_primary) for f in f if f.endswith(".parquet")]
+                    for f in s_files:
+                        try:
+                            df = pd.read_parquet(f)
+                            if 'inference_ts' in df.columns:
+                                df['inference_ts'] = pd.to_datetime(df['inference_ts'], utc=True)
+                                lag_rows += len(df[df['inference_ts'] > pd.to_datetime(last_ts, utc=True)])
+                        except: pass
+        except: pass
 
-    def get_kafka_counts(self):
-        counts = {m: 0 for m in VEHICLE_MODULES}
-        if not self.consumer:
-            self._connect()
-            return counts
-            
-        for m in VEHICLE_MODULES:
-            topic = f"telemetry.{m}"
-            total = 0
+        # 2. Read Gold Alerts Table
+        df_alerts = pd.DataFrame()
+        if os.path.exists(ALERTS_ROOT):
             try:
-                meta = self.consumer.list_topics(topic, timeout=0.5)
-                if topic in meta.topics:
-                    parts = [TopicPartition(topic, p) for p in meta.topics[topic].partitions]
-                    for p in parts:
-                        _, high = self.consumer.get_watermark_offsets(p, timeout=0.5, cached=False)
-                        if high > 0:
-                            total += high
-            except Exception: 
+                if DeltaTable.is_deltatable(ALERTS_ROOT):
+                    df_alerts = DeltaTable(Path(ALERTS_ROOT).as_posix()).to_pandas()
+            except Exception:
                 pass
-            counts[m] = total
-        return counts
+        
+        active_alerts = 0
+        crit_vehicles = 0
+        open_alerts = []
+        closed_alerts = []
 
-def get_delta_counts():
-    delta_counts = {m: 0 for m in VEHICLE_MODULES}
-    for m in VEHICLE_MODULES:
-        path = Path(DELTA_ROOT) / m
-        if not path.exists():
-            continue
-        try:
-            if DeltaTable.is_deltatable(path.as_posix()):
-                delta_counts[m] = DeltaTable(path.as_posix()).to_pyarrow_dataset().count_rows()
-        except Exception:
-            pass
-    return delta_counts
+        if not df_alerts.empty:
+            df_alerts = df_alerts.fillna(0)
+            for col in df_alerts.select_dtypes(include=['datetime64[ns]', 'datetime64[ns, UTC]']).columns:
+                df_alerts[col] = df_alerts[col].astype(str)
 
-async def update_writer_metrics_loop():
-    kafka_monitor = TelemetryBackend()
+            open_df = df_alerts[df_alerts['status'] == "OPEN"].sort_values('peak_anomaly_ts', ascending=False)
+            closed_df = df_alerts[df_alerts['status'] == "CLOSED"].sort_values('alert_end_ts', ascending=False)
+
+            active_alerts = len(open_df)
+            crit_vehicles = open_df['source_id'].nunique() if not open_df.empty else 0
+            open_alerts = open_df.head(100).to_dict(orient="records")
+            closed_alerts = closed_df.head(50).to_dict(orient="records")
+
+        # 3. Update Cache Exactly as React Expects
+        ALERTS_METRICS_CACHE["active_alerts_count"] = active_alerts
+        ALERTS_METRICS_CACHE["critical_vehicles"] = crit_vehicles
+        ALERTS_METRICS_CACHE["processing_lag"] = lag_rows
+        ALERTS_METRICS_CACHE["open_alerts"] = open_alerts
+        ALERTS_METRICS_CACHE["closed_alerts"] = closed_alerts
+
+    except Exception as e:
+        print(f"Alerts metrics loop failed: {e}")
+
+async def update_alerts_metrics_loop():
     while True:
-        try:
-            # Offload heavy synchronous calls to threads
-            k_counts = await asyncio.to_thread(kafka_monitor.get_kafka_counts)
-            d_counts = await asyncio.to_thread(get_delta_counts)
-
-            for module in VEHICLE_MODULES:
-                k_total = k_counts.get(module, 0)
-                d_total = d_counts.get(module, 0)
-                
-                file_path = os.path.join(STATE_DIR, f"writer_metrics_{module}.json")
-                spark_data = safe_read_json(file_path) or {}
-                stream_data = spark_data.get("streams", {}).get(module, {})
-                
-                status = spark_data.get("status", "OFFLINE")
-                last_updated = spark_data.get("last_updated", 0)
-                if status == "RUNNING":
-                    if last_updated < SERVICE_START_TIME:
-                        status = "STARTING"
-                    elif time.time() - last_updated > 10:
-                        status = "STALLED"
-
-                WRITER_METRICS_CACHE[module] = {
-                    "module": module.upper(),
-                    "status": status,
-                    "kafka_total": k_total,
-                    "delta_total": d_total,
-                    "true_lag": max(0, k_total - d_total),
-                    "throughput": str(round(stream_data.get("input_rate", 0.0), 1)),
-                    "processed": str(round(stream_data.get("process_rate", 0.0), 1)),
-                    "latency_ms": stream_data.get("duration_ms", 0)
-                }
-        except Exception as e:
-            print(f"Writer metric update failed: {e}")
+        await asyncio.to_thread(_sync_update_alerts)
         await asyncio.sleep(2)
 
 @app.on_event("startup")
 async def startup_event():
-    asyncio.create_task(update_writer_metrics_loop())
+    asyncio.create_task(update_alerts_metrics_loop())
 
 # --- Endpoints ---
-@app.get("/api/writer/metrics")
-def get_writer_metrics():
-    return WRITER_METRICS_CACHE
-
-@app.get("/api/writer/inspector/{module}")
-def get_writer_inspector(module: str, limit: int = Query(default=100, ge=1, le=500)):
-    if module not in VEHICLE_MODULES:
-        raise HTTPException(status_code=400, detail="Invalid module")
-    path = Path(DELTA_ROOT) / module
-    if not path.exists():
-        return {"data": []}
-    try:
-        dfs = []
-        for entry in sorted(path.iterdir(), key=lambda e: e.name):
-            if not (entry.is_dir() and entry.name.startswith("source_id=")):
-                continue
-            sim_id = entry.name.split("=", 1)[1]
-            part_files = sorted(
-                (f for f in entry.iterdir() if f.is_file() and f.name.endswith(".parquet")),
-                key=lambda f: f.stat().st_mtime,
-                reverse=True,
-            )[:4]
-            for f in part_files:
-                try:
-                    df_file = pd.read_parquet(f)
-                    df_file["source_id"] = sim_id
-                    if not df_file.empty:
-                        dfs.append(df_file)
-                except Exception:
-                    pass
-
-        if not dfs:
-            return {"data": []}
-
-        combined = pd.concat(dfs, ignore_index=True)
-        if "ingest_ts" in combined.columns:
-            combined["ingest_ts"] = pd.to_datetime(combined["ingest_ts"], utc=True)
-            combined = combined.sort_values("ingest_ts", ascending=False)
-            if "source_id" in combined.columns:
-                n_sims = max(combined["source_id"].nunique(), 1)
-                rows_per_sim = max(10, 100 // n_sims)
-                combined = combined.groupby("source_id", group_keys=False).head(rows_per_sim)
-                combined = combined.sort_values("ingest_ts", ascending=False)
-            combined = combined.head(limit)
-            combined["ingest_ts"] = combined["ingest_ts"].astype(str)
-        combined = combined.fillna(0)
-        for col in combined.select_dtypes(include=["datetime64[ns]", "datetime64[ns, UTC]"]).columns:
-            combined[col] = combined[col].astype(str)
-        return {"data": combined.to_dict(orient="records")}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+@app.get("/api/alerts/metrics")
+def get_alerts_metrics():
+    return ALERTS_METRICS_CACHE
 
 if __name__ == "__main__":
     import uvicorn
-    # Writer runs on port 8001
-    uvicorn.run("api:app", host="127.0.0.1", port=8001, reload=True)
+    # Alerts & DTC runs on port 8004
+    uvicorn.run("api:app", host="127.0.0.1", port=8004, reload=True)

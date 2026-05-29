@@ -673,22 +673,14 @@ def get_vehicle_alerts(vehicle_id: str):
     import pandas as pd
     if not os.path.exists(_GOLD_ALERTS_DIR):
         return {"vehicle_id": vehicle_id, "open": [], "closed": []}
-    files = [
-        os.path.join(r, f)
-        for r, _, ff in os.walk(_GOLD_ALERTS_DIR)
-        for f in ff if f.endswith(".parquet")
-    ]
-    dfs = []
-    for fp in files:
-        try:
-            df = pd.read_parquet(fp)
-            if not df.empty:
-                dfs.append(df)
-        except Exception:
-            pass
-    if not dfs:
+    try:
+        from deltalake import DeltaTable
+        from pathlib import Path
+        if not DeltaTable.is_deltatable(_GOLD_ALERTS_DIR):
+            return {"vehicle_id": vehicle_id, "open": [], "closed": []}
+        combined = DeltaTable(Path(_GOLD_ALERTS_DIR).as_posix()).to_pandas()
+    except Exception:
         return {"vehicle_id": vehicle_id, "open": [], "closed": []}
-    combined = pd.concat(dfs, ignore_index=True)
     vehicle_df = combined[combined["source_id"] == vehicle_id].copy()
     if vehicle_df.empty:
         return {"vehicle_id": vehicle_id, "open": [], "closed": []}
