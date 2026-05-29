@@ -210,19 +210,36 @@ def _seed_all_demo_data() -> None:
         _DEMO_VEHICLE_HEALTH_CACHE[vid] = _generate_vehicle_health_history(_DEMO_SILVER_CACHE[vid])
 
 
-# ── Bronze parquet reader — injects source_id from Hive partition path ───────
+# ── Bronze partition iterator — reads Hive-partitioned source_id=X dirs ──────
 
-def _read_bronze_parquet(fp: str):
+def _iter_bronze_by_vehicle(module: str, max_files_per_vehicle: int = 40):
     import pandas as pd
-    df = pd.read_parquet(fp)
-    if df.empty:
-        return df
-    if "source_id" not in df.columns:
-        for part in fp.replace("\\", "/").split("/"):
-            if part.startswith("source_id="):
-                df["source_id"] = part.split("=", 1)[1]
-                break
-    return df
+    bronze_path = os.path.join(_DELTA_ROOT, module)
+    if not os.path.exists(bronze_path):
+        return
+    try:
+        for entry in os.scandir(bronze_path):
+            if not entry.is_dir() or not entry.name.startswith("source_id="):
+                continue
+            vid = entry.name.split("=", 1)[1]
+            pfiles = sorted(
+                [f.path for f in os.scandir(entry.path) if f.is_file() and f.name.endswith(".parquet")],
+                key=os.path.getmtime, reverse=True,
+            )
+            dfs = []
+            for fp in pfiles[:max_files_per_vehicle]:
+                try:
+                    df = pd.read_parquet(fp)
+                    if not df.empty:
+                        dfs.append(df)
+                except Exception:
+                    pass
+            if dfs:
+                vdf = pd.concat(dfs, ignore_index=True)
+                vdf["source_id"] = vid
+                yield vid, vdf
+    except Exception:
+        pass
 
 
 # ── Mileage join helper ───────────────────────────────────────────────────────
@@ -612,7 +629,6 @@ def get_vehicle_module_decomposition(vehicle_id: str):
 
 @router.get("/api/automotive/module-crossfleet/{module}")
 def get_automotive_module_crossfleet(module: str):
-    import pandas as pd
     if module not in _VEHICLE_MODULES:
         raise HTTPException(status_code=400, detail="Invalid module")
 
@@ -620,30 +636,14 @@ def get_automotive_module_crossfleet(module: str):
     sensor_keys = list(specs.keys())
     vehicle_stats: list = []
 
-    bronze_path = os.path.join(_DELTA_ROOT, module)
-    if os.path.exists(bronze_path):
-        pfiles = sorted(
-            [os.path.join(r, f) for r, _, ff in os.walk(bronze_path) for f in ff if f.endswith(".parquet")],
-            key=os.path.getmtime, reverse=True,
-        )
-        dfs = []
-        for fp in pfiles[:30]:
-            try:
-                df = _read_bronze_parquet(fp)
-                if not df.empty and "source_id" in df.columns:
-                    dfs.append(df)
-            except Exception:
-                pass
-        if dfs:
-            combined = pd.concat(dfs, ignore_index=True)
-            for vid, grp in combined.groupby("source_id"):
-                stat: dict = {"vehicle_id": str(vid)}
-                for sk in sensor_keys:
-                    if sk in grp.columns:
-                        stat[f"{sk}_avg"] = round(float(grp[sk].mean()), 3)
-                        stat[f"{sk}_min"] = round(float(grp[sk].min()), 3)
-                        stat[f"{sk}_max"] = round(float(grp[sk].max()), 3)
-                vehicle_stats.append(stat)
+    for vid, grp in _iter_bronze_by_vehicle(module):
+        stat: dict = {"vehicle_id": vid}
+        for sk in sensor_keys:
+            if sk in grp.columns:
+                stat[f"{sk}_avg"] = round(float(grp[sk].mean()), 3)
+                stat[f"{sk}_min"] = round(float(grp[sk].min()), 3)
+                stat[f"{sk}_max"] = round(float(grp[sk].max()), 3)
+        vehicle_stats.append(stat)
 
     if not vehicle_stats and _PRESENTATION_MODE_ACTIVE and _DEMO_SEED_CACHE:
         for vid in _DEMO_VEHICLES:
@@ -871,7 +871,6 @@ def get_module_fleet_health(module: str):
 
 @router.get("/api/automotive/module-sensor-stats/{module}")
 def get_module_sensor_stats(module: str):
-    import pandas as pd
     import numpy as np
     if module not in _VEHICLE_MODULES:
         raise HTTPException(status_code=400, detail="Invalid module")
@@ -880,35 +879,19 @@ def get_module_sensor_stats(module: str):
     sensor_keys = list(specs.keys())
     vehicle_stats = []
 
-    bronze_path = os.path.join(_DELTA_ROOT, module)
-    if os.path.exists(bronze_path):
-        pfiles = sorted(
-            [os.path.join(r, f) for r, _, ff in os.walk(bronze_path) for f in ff if f.endswith(".parquet")],
-            key=os.path.getmtime, reverse=True,
-        )
-        dfs = []
-        for fp in pfiles[:30]:
-            try:
-                df = _read_bronze_parquet(fp)
-                if not df.empty and "source_id" in df.columns:
-                    dfs.append(df)
-            except Exception:
-                pass
-        if dfs:
-            combined = pd.concat(dfs, ignore_index=True)
-            for vid, grp in combined.groupby("source_id"):
-                stat: dict = {"vehicle_id": str(vid)}
-                for sk in sensor_keys:
-                    if sk in grp.columns:
-                        vals = grp[sk].dropna().values.astype(float)
-                        if len(vals) > 0:
-                            stat[f"{sk}_min"] = round(float(np.min(vals)), 3)
-                            stat[f"{sk}_p25"] = round(float(np.percentile(vals, 25)), 3)
-                            stat[f"{sk}_median"] = round(float(np.median(vals)), 3)
-                            stat[f"{sk}_p75"] = round(float(np.percentile(vals, 75)), 3)
-                            stat[f"{sk}_max"] = round(float(np.max(vals)), 3)
-                            stat[f"{sk}_mean"] = round(float(np.mean(vals)), 3)
-                vehicle_stats.append(stat)
+    for vid, grp in _iter_bronze_by_vehicle(module):
+        stat: dict = {"vehicle_id": vid}
+        for sk in sensor_keys:
+            if sk in grp.columns:
+                vals = grp[sk].dropna().values.astype(float)
+                if len(vals) > 0:
+                    stat[f"{sk}_min"] = round(float(np.min(vals)), 3)
+                    stat[f"{sk}_p25"] = round(float(np.percentile(vals, 25)), 3)
+                    stat[f"{sk}_median"] = round(float(np.median(vals)), 3)
+                    stat[f"{sk}_p75"] = round(float(np.percentile(vals, 75)), 3)
+                    stat[f"{sk}_max"] = round(float(np.max(vals)), 3)
+                    stat[f"{sk}_mean"] = round(float(np.mean(vals)), 3)
+        vehicle_stats.append(stat)
 
     if not vehicle_stats and _PRESENTATION_MODE_ACTIVE and _DEMO_SEED_CACHE:
         for vid in _DEMO_VEHICLES:
@@ -939,32 +922,21 @@ def get_module_sensor_fleet_history(module: str, sensor: str):
         raise HTTPException(status_code=400, detail="Invalid module")
 
     vehicle_pts: dict = {}
-    bronze_path = os.path.join(_DELTA_ROOT, module)
-    if os.path.exists(bronze_path):
-        pfiles = sorted(
-            [os.path.join(r, f) for r, _, ff in os.walk(bronze_path) for f in ff if f.endswith(".parquet")],
-            key=os.path.getmtime, reverse=True,
-        )
-        dfs = []
-        for fp in pfiles[:30]:
-            try:
-                df = _read_bronze_parquet(fp)
-                if not df.empty and "source_id" in df.columns and sensor in df.columns:
-                    ts_col = next((c for c in ("timestamp", "ingest_ts") if c in df.columns), None)
-                    if ts_col:
-                        df["_ts"] = pd.to_datetime(df[ts_col], errors="coerce")
-                        dfs.append(df[["source_id", "_ts", sensor]].dropna())
-            except Exception:
-                pass
-        if dfs:
-            combined = pd.concat(dfs, ignore_index=True)
-            for vid, grp in combined.groupby("source_id"):
-                grp = grp.sort_values("_ts")
-                factor = max(1, len(grp) // 200)
-                grp = grp.iloc[::factor]
-                grp = grp.copy()
-                grp["ts"] = grp["_ts"].dt.strftime("%Y-%m-%d %H:%M")
-                vehicle_pts[str(vid)] = [{"ts": r["ts"], "v": round(float(r[sensor]), 3)} for _, r in grp.iterrows()]
+    for vid, grp in _iter_bronze_by_vehicle(module):
+        if sensor not in grp.columns:
+            continue
+        ts_col = next((c for c in ("timestamp", "ingest_ts") if c in grp.columns), None)
+        if not ts_col:
+            continue
+        grp = grp[[ts_col, sensor]].copy()
+        grp["_ts"] = pd.to_datetime(grp[ts_col], errors="coerce")
+        grp = grp.dropna(subset=["_ts", sensor]).sort_values("_ts")
+        if grp.empty:
+            continue
+        factor = max(1, len(grp) // 200)
+        grp = grp.iloc[::factor].copy()
+        grp["ts"] = grp["_ts"].dt.strftime("%Y-%m-%d %H:%M:%S")
+        vehicle_pts[vid] = [{"ts": r["ts"], "v": round(float(r[sensor]), 3)} for _, r in grp.iterrows()]
 
     if not vehicle_pts and _PRESENTATION_MODE_ACTIVE and _DEMO_SEED_CACHE:
         for vid in _DEMO_VEHICLES:
