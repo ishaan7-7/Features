@@ -236,6 +236,7 @@ export default function AutomotiveDive() {
   const [dtcResult, setDtcResult] = useState<any>(null);
   const [dtcRunning, setDtcRunning] = useState(false);
   const [vehicleTimelineSensorKey, setVehicleTimelineSensorKey] = useState<string>('');
+  const [fleetSensorKey, setFleetSensorKey] = useState<string>('');
 
   const fleetQuery = useQuery({
     queryKey: ['autoFleetSummary'],
@@ -356,6 +357,7 @@ export default function AutomotiveDive() {
     const keys = crossfleetQuery.data?.sensor_keys;
     if (keys?.length > 0 && !analysisKey) setAnalysisKey(keys[0]);
     if (keys?.length > 0 && !distributionKey) setDistributionKey(keys[0]);
+    if (keys?.length > 0 && !fleetSensorKey) setFleetSensorKey(keys[0]);
   }, [crossfleetQuery.data]);
 
   useEffect(() => {
@@ -419,11 +421,11 @@ export default function AutomotiveDive() {
     () =>
       crossfleetVehicles.map((v: any) => ({
         vehicle_id: v.vehicle_id,
-        avg: v[`${currentAnalysisKey}_avg`] ?? 0,
-        min: v[`${currentAnalysisKey}_min`] ?? 0,
-        max: v[`${currentAnalysisKey}_max`] ?? 0,
+        avg: v[`${fleetSensorKey}_avg`] ?? 0,
+        min: v[`${fleetSensorKey}_min`] ?? 0,
+        max: v[`${fleetSensorKey}_max`] ?? 0,
       })),
-    [crossfleetVehicles, currentAnalysisKey],
+    [crossfleetVehicles, fleetSensorKey],
   );
 
   const moduleTimelineData: any[] = useMemo(() => {
@@ -463,7 +465,9 @@ export default function AutomotiveDive() {
   const moduleRankings: any[] = moduleFleetRankingQuery.data?.rankings || [];
 
   const rankingChartData = useMemo(
-    () => moduleRankings.map((r: any) => ({ vehicle_id: r.vehicle_id, avg_health: r.avg_health })),
+    () => [...moduleRankings]
+      .sort((a: any, b: any) => b.avg_health - a.avg_health)
+      .map((r: any) => ({ vehicle_id: r.vehicle_id, avg_health: r.avg_health })),
     [moduleRankings],
   );
 
@@ -611,7 +615,7 @@ export default function AutomotiveDive() {
       ),
     },
     {
-      field: 'avg_health', headerName: 'AVG HEALTH', width: 120, sortable: true,
+      field: 'avg_health', headerName: 'AVG HEALTH', width: 120, sortable: true, sort: 'desc' as const,
       cellStyle: (params: any) => ({ fontWeight: 'bold', color: params.value < 60 ? '#d32f2f' : params.value < 80 ? '#f57c00' : '#388e3c' }),
       valueFormatter: (params: any) => `${params.value}%`,
     },
@@ -1795,6 +1799,57 @@ export default function AutomotiveDive() {
             </Typography>
             <Box sx={{ flex: 1, height: '1px', bgcolor: '#e0e0e0' }} />
           </Box>
+
+          {/* ── SECTION: Fleet Average & Fleet Range with dedicated sensor selector ── */}
+          <Paper sx={{ p: 1.5, borderRadius: 0 }}>
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, mb: 1.5, flexWrap: 'wrap' }}>
+              <Typography variant="caption" sx={{ fontWeight: 'bold', color: '#616161' }}>
+                FLEET SENSOR STATS — {analysisModule.toUpperCase()} &nbsp;
+                <span style={{ color: '#9e9e9e', fontWeight: 'normal' }}>(BRONZE · average and min/max per vehicle)</span>
+              </Typography>
+              {sensorKeys.length > 0 && (
+                <FormControl size="small" sx={{ minWidth: 260 }}>
+                  <Select
+                    value={fleetSensorKey || sensorKeys[0] || ''}
+                    onChange={(e) => setFleetSensorKey(e.target.value)}
+                    sx={{ borderRadius: 0, fontFamily: 'monospace', fontSize: '11px' }}
+                  >
+                    {sensorKeys.map((k) => (
+                      <MenuItem key={k} value={k} sx={{ fontFamily: 'monospace', fontSize: '11px' }}>
+                        {k.replace(/_/g, ' ').toUpperCase()}
+                      </MenuItem>
+                    ))}
+                  </Select>
+                </FormControl>
+              )}
+            </Box>
+            <Box sx={{ display: 'flex', gap: 2 }}>
+              <Box sx={{ flex: 1 }}>
+                <Typography variant="caption" sx={{ color: '#9e9e9e', fontSize: '10px', fontFamily: 'monospace', mb: 0.5, display: 'block' }}>
+                  AVERAGE PER VEHICLE
+                </Typography>
+                <EChart
+                  option={fleetAvgOption}
+                  style={{ height: '200px', width: '100%' }}
+                  loading={crossfleetQuery.isLoading}
+                  empty={crossfleetChartData.length === 0}
+                  emptyText="No bronze sensor data"
+                />
+              </Box>
+              <Box sx={{ flex: 1 }}>
+                <Typography variant="caption" sx={{ color: '#9e9e9e', fontSize: '10px', fontFamily: 'monospace', mb: 0.5, display: 'block' }}>
+                  MIN / MAX PER VEHICLE
+                </Typography>
+                <EChart
+                  option={fleetRangeOption}
+                  style={{ height: '200px', width: '100%' }}
+                  loading={crossfleetQuery.isLoading}
+                  empty={crossfleetChartData.length === 0}
+                  emptyText="No bronze sensor data"
+                />
+              </Box>
+            </Box>
+          </Paper>
 
           {/* ── SECTION: Sensor distribution stats table (p25/median/p75 per vehicle) ── */}
           <Paper sx={{ p: 1.5, borderRadius: 0 }}>

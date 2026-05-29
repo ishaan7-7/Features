@@ -731,22 +731,31 @@ def get_module_fleet_ranking(module: str):
     vehicle_data: dict = {}
     silver_path = os.path.join(_SILVER_ROOT, module)
     if os.path.exists(silver_path):
-        pfiles = sorted(
-            [os.path.join(r, f) for r, _, ff in os.walk(silver_path) for f in ff if f.endswith(".parquet")],
-            key=os.path.getmtime, reverse=True,
-        )
-        dfs = []
-        for fp in pfiles[:20]:
-            try:
-                df = pd.read_parquet(fp)
-                if not df.empty and "source_id" in df.columns and "health_score" in df.columns:
-                    dfs.append(df[["source_id", "health_score"]])
-            except Exception:
-                pass
-        if dfs:
-            combined = pd.concat(dfs, ignore_index=True)
-            for vid, grp in combined.groupby("source_id"):
-                vehicle_data[str(vid)] = grp["health_score"].dropna().tolist()
+        try:
+            from deltalake import DeltaTable
+            from pathlib import Path
+            dt = DeltaTable(Path(silver_path).as_posix())
+            df_all = dt.to_pandas(columns=["source_id", "health_score"])
+            if not df_all.empty and "source_id" in df_all.columns and "health_score" in df_all.columns:
+                for vid, grp in df_all.groupby("source_id"):
+                    vehicle_data[str(vid)] = grp["health_score"].dropna().tolist()
+        except Exception:
+            pfiles = sorted(
+                [os.path.join(r, f) for r, _, ff in os.walk(silver_path) for f in ff if f.endswith(".parquet")],
+                key=os.path.getmtime, reverse=True,
+            )
+            dfs = []
+            for fp in pfiles[:60]:
+                try:
+                    df = pd.read_parquet(fp)
+                    if not df.empty and "source_id" in df.columns and "health_score" in df.columns:
+                        dfs.append(df[["source_id", "health_score"]])
+                except Exception:
+                    pass
+            if dfs:
+                combined = pd.concat(dfs, ignore_index=True)
+                for vid, grp in combined.groupby("source_id"):
+                    vehicle_data[str(vid)] = grp["health_score"].dropna().tolist()
 
     if not vehicle_data and _PRESENTATION_MODE_ACTIVE and _DEMO_SILVER_CACHE:
         for vid in _DEMO_VEHICLES:
@@ -788,7 +797,7 @@ def get_module_fleet_ranking(module: str):
             "total_pts": len(scores),
             "alert_count": alert_counts.get(vid, 0),
         })
-    rankings.sort(key=lambda x: x["avg_health"])
+    rankings.sort(key=lambda x: x["avg_health"], reverse=True)
     return {"module": module, "rankings": rankings}
 
 
